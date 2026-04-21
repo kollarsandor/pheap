@@ -170,7 +170,7 @@ pub const TransactionManager = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn begin(self: *Self) !Transaction {
+    pub fn begin(self: *Self) !*Transaction {
         self.lock.lock();
         defer self.lock.unlock();
 
@@ -186,10 +186,10 @@ pub const TransactionManager = struct {
         const tx = Transaction.init(self.allocator, id, wal_tx);
         try self.active_transactions.put(id, tx);
 
-        var entry = self.active_transactions.getPtr(id).?;
+        const entry = self.active_transactions.getPtr(id).?;
         entry.state = .active;
 
-        return entry.*;
+        return entry;
     }
 
     pub fn commit(self: *Self, tx: *Transaction) !void {
@@ -377,11 +377,10 @@ test "transaction manager lifecycle" {
     var tx_mgr = try TransactionManager.init(alloc, wal, heap);
     defer tx_mgr.deinit();
 
-    var tx = try tx_mgr.begin();
-    defer tx.deinit();
-
+    const tx = try tx_mgr.begin();
     try testing.expect(tx.state == .active);
     try testing.expect(tx.id > 0);
+    try tx_mgr.rollback(tx);
 }
 
 test "transaction commit" {
@@ -404,9 +403,9 @@ test "transaction commit" {
     var tx_mgr = try TransactionManager.init(alloc, wal, heap);
     defer tx_mgr.deinit();
 
-    var tx = try tx_mgr.begin();
-    try tx_mgr.recordAllocate(&tx, 100, 64);
-    try tx_mgr.commit(&tx);
+    const tx = try tx_mgr.begin();
+    try tx_mgr.recordAllocate(tx, 100, 64);
+    try tx_mgr.commit(tx);
 
     try testing.expectEqual(@as(usize, 0), tx_mgr.getActiveTransactionCount());
 }

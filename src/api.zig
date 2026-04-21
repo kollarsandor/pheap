@@ -468,16 +468,16 @@ pub const PersistentStore = struct {
     }
 
     pub fn setRoot(self: *PersistentStore, ptr: pointer.PersistentPtr) !void {
-        var tx = try self.tx_manager.begin();
-        errdefer self.tx_manager.rollback(&tx) catch {};
+        const tx = try self.tx_manager.begin();
+        errdefer self.tx_manager.rollback(tx) catch {};
 
-        try self.tx_manager.recordRootUpdate(&tx, self.root, ptr);
-        try self.tx_manager.commit(&tx);
+        try self.tx_manager.recordRootUpdate(tx, self.root, ptr);
+        try self.tx_manager.commit(tx);
 
         self.root = ptr;
     }
 
-    pub fn beginTransaction(self: *PersistentStore) !transaction_mod.Transaction {
+    pub fn beginTransaction(self: *PersistentStore) !*transaction_mod.Transaction {
         return try self.tx_manager.begin();
     }
 

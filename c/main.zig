@@ -134,7 +134,7 @@ pub const Runtime = struct {
         self.arena.deinit();
     }
 
-    pub fn beginTransaction(self: *Runtime) !transaction.Transaction {
+    pub fn beginTransaction(self: *Runtime) !*transaction.Transaction {
         return self.tx_manager.begin();
     }
 
@@ -235,16 +235,16 @@ pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     try stdout.print("Persistent Heap Runtime Initialized\n", .{});
 
-    var tx = try runtime.beginTransaction();
+    const tx = try runtime.beginTransaction();
     defer {
-        runtime.rollback(&tx) catch {};
+        runtime.rollback(tx) catch {};
     }
 
     const test_size: u64 = 256;
     const ptr = try runtime.allocate(test_size, 64);
     try stdout.print("Allocated {} bytes at offset {}\n", .{ test_size, ptr.offset });
 
-    try runtime.setRoot(&tx, ptr);
+    try runtime.setRoot(tx, ptr);
 
     const native_ptr = try runtime.heap.resolvePtr(ptr);
     if (native_ptr) |np| {
@@ -252,7 +252,7 @@ pub fn main() !void {
         @memset(slice, 0xAB);
     }
 
-    try runtime.commit(&tx);
+    try runtime.commit(tx);
     try stdout.print("Transaction committed\n", .{});
 
     const stats = runtime.getStats();
@@ -308,14 +308,14 @@ test "allocation and persistence" {
     var runtime = try Runtime.init(alloc, config);
     defer runtime.deinit();
 
-    var tx = try runtime.beginTransaction();
+    const tx = try runtime.beginTransaction();
     const ptr = try runtime.allocate(128, 64);
-    try runtime.setRoot(&tx, ptr);
-    try runtime.commit(&tx);
+    try runtime.setRoot(tx, ptr);
+    try runtime.commit(tx);
 
-    var tx2 = try runtime.beginTransaction();
+    const tx2 = try runtime.beginTransaction();
     _ = try runtime.allocate(256, 64);
-    try runtime.commit(&tx2);
+    try runtime.commit(tx2);
 
     const stats = runtime.getStats();
     try testing.expect(stats.allocation_count == 2);
@@ -343,9 +343,9 @@ test "transaction rollback" {
     var runtime = try Runtime.init(alloc, config);
     defer runtime.deinit();
 
-    var tx = try runtime.beginTransaction();
+    const tx = try runtime.beginTransaction();
     _ = try runtime.allocate(128, 64);
-    try runtime.rollback(&tx);
+    try runtime.rollback(tx);
 
     const stats = runtime.getStats();
     try testing.expect(stats.allocation_count == 0);
