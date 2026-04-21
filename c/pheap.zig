@@ -37,18 +37,15 @@ pub const PersistentHeap = struct {
         const path_copy = try allocator_ptr.dupe(u8, file_path);
 
         const aligned_size = alignToPageSize(size);
-        var file = try openOrCreateFile(file_path, aligned_size);
+        const open_result = try openOrCreateFile(file_path, aligned_size);
+        var file = open_result.file;
+        const needs_init = open_result.created;
         errdefer file.close();
 
         const base_addr = try mapFile(file.handle, aligned_size);
         errdefer unmapFile(base_addr, aligned_size);
 
         const heap_header: *header.HeapHeader = @ptrCast(@alignCast(base_addr));
-
-        const needs_init = blk: {
-            const stat = try file.stat();
-            break :blk stat.size == 0;
-        };
 
         if (needs_init) {
             heap_header.* = header.HeapHeader.init(aligned_size);
@@ -343,19 +340,26 @@ fn alignToPageSize(value: u64) u64 {
     return alignTo(value, std.mem.page_size);
 }
 
-fn openOrCreateFile(path: []const u8, size: u64) !std.fs.File {
-    const file = std.fs.cwd().createFile(
-        path,
-        .{ .read = true, .truncate = false, .exclusive = false },
-    ) catch |err| {
-        if (err == error.PathAlreadyExists) {
-            return std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        }
-        return err;
-    };
+const OpenResult = struct {
+    file: std.fs.File,
+    created: bool,
+};
 
-    try file.setEndPos(size);
-    return file;
+fn openOrCreateFile(path: []const u8, size: u64) !OpenResult {
+    if (std.fs.cwd().openFile(path, .{ .mode = .read_write })) |existing| {
+        const stat = try existing.stat();
+        if (stat.size < size) {
+            try existing.setEndPos(size);
+        }
+        return .{ .file = existing, .created = stat.size == 0 };
+    } else |err| switch (err) {
+        error.FileNotFound => {
+            const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = false });
+            try file.setEndPos(size);
+            return .{ .file = file, .created = true };
+        },
+        else => return err,
+    }
 }
 
 fn mapFile(fd: posix.fd_t, size: u64) ![*]align(std.mem.page_size) u8 {

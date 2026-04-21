@@ -40,7 +40,8 @@ pub const Runtime = struct {
     security: *SecurityManager,
     gpu_ctx: ?*GPUContext,
     store: *PersistentStore,
-    arena: std.heap.ArenaAllocator,
+    arena: *std.heap.ArenaAllocator,
+    parent_allocator: std.mem.Allocator,
     config: RuntimeConfig,
 
     pub const RuntimeConfig = struct {
@@ -57,11 +58,14 @@ pub const Runtime = struct {
     };
 
     pub fn init(allocator_ptr: std.mem.Allocator, config: RuntimeConfig) !*Runtime {
-        var arena = std.heap.ArenaAllocator.init(allocator_ptr);
-        errdefer arena.deinit();
-        const arena_alloc = arena.allocator();
+        const arena_ptr = try allocator_ptr.create(std.heap.ArenaAllocator);
+        errdefer allocator_ptr.destroy(arena_ptr);
+        arena_ptr.* = std.heap.ArenaAllocator.init(allocator_ptr);
+        errdefer arena_ptr.deinit();
+        const arena_alloc = arena_ptr.allocator();
 
-        const self = try arena_alloc.create(Runtime);
+        const self = try allocator_ptr.create(Runtime);
+        errdefer allocator_ptr.destroy(self);
         self.* = Runtime{
             .heap = undefined,
             .alloc = undefined,
@@ -73,7 +77,8 @@ pub const Runtime = struct {
             .security = undefined,
             .gpu_ctx = null,
             .store = undefined,
-            .arena = arena,
+            .arena = arena_ptr,
+            .parent_allocator = allocator_ptr,
             .config = config,
         };
 
@@ -99,6 +104,7 @@ pub const Runtime = struct {
 
         self.tx_manager = try TransactionManager.init(arena_alloc, self.wal, self.heap);
         errdefer self.tx_manager.deinit();
+        self.tx_manager.setAllocatorHook(@ptrCast(self.alloc), undoAllocationThunk);
 
         self.gc = try RefCountGC.init(arena_alloc, self.alloc, self.wal);
         errdefer self.gc.deinit();
@@ -131,11 +137,20 @@ pub const Runtime = struct {
         self.wal.deinit();
         self.heap.deinit();
         self.security.deinit();
-        self.arena.deinit();
+        const parent = self.parent_allocator;
+        const arena_ptr = self.arena;
+        arena_ptr.deinit();
+        parent.destroy(arena_ptr);
+        parent.destroy(self);
     }
 
     pub fn beginTransaction(self: *Runtime) !*transaction.Transaction {
         return self.tx_manager.begin();
+    }
+
+    fn undoAllocationThunk(ctx: *anyopaque, offset: u64, size: u64) anyerror!void {
+        const alloc_ptr: *PersistentAllocator = @ptrCast(@alignCast(ctx));
+        try alloc_ptr.undoAllocation(offset, size);
     }
 
     pub fn commit(self: *Runtime, tx: *transaction.Transaction) !void {
@@ -147,7 +162,14 @@ pub const Runtime = struct {
     }
 
     pub fn allocate(self: *Runtime, size: u64, alignment: u64) !pointer.PersistentPtr {
-        return self.alloc.alloc(size, alignment);
+        const ptr = try self.alloc.alloc(size, alignment);
+        if (self.tx_manager.active_transactions.count() > 0) {
+            const latest_id = self.tx_manager.transaction_counter;
+            if (self.tx_manager.active_transactions.getPtr(latest_id)) |tx| {
+                tx.trackAllocation(ptr.offset, size) catch {};
+            }
+        }
+        return ptr;
     }
 
     pub fn free(self: *Runtime, ptr: pointer.PersistentPtr) !void {

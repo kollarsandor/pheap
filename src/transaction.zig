@@ -64,6 +64,11 @@ pub const Operation = struct {
     }
 };
 
+pub const PendingAllocation = struct {
+    offset: u64,
+    size: u64,
+};
+
 pub const Transaction = struct {
     id: u64,
     state: TransactionState,
@@ -73,6 +78,7 @@ pub const Transaction = struct {
     allocator: std.mem.Allocator,
     read_set: std.ArrayList(u64),
     write_set: std.ArrayList(u64),
+    pending_allocations: std.ArrayList(PendingAllocation),
     parent_tx: ?u64,
 
     pub fn init(allocator_ptr: std.mem.Allocator, id: u64, wal_tx: wal_mod.Transaction) Transaction {
@@ -85,6 +91,7 @@ pub const Transaction = struct {
             .allocator = allocator_ptr,
             .read_set = std.ArrayList(u64).init(allocator_ptr),
             .write_set = std.ArrayList(u64).init(allocator_ptr),
+            .pending_allocations = std.ArrayList(PendingAllocation).init(allocator_ptr),
             .parent_tx = null,
         };
     }
@@ -96,6 +103,11 @@ pub const Transaction = struct {
         self.operations.deinit();
         self.read_set.deinit();
         self.write_set.deinit();
+        self.pending_allocations.deinit();
+    }
+
+    pub fn trackAllocation(self: *Transaction, offset: u64, size: u64) !void {
+        try self.pending_allocations.append(.{ .offset = offset, .size = size });
     }
 
     pub fn addOperation(self: *Transaction, op: Operation) !void {
@@ -135,11 +147,22 @@ pub const Transaction = struct {
 pub const TransactionManager = struct {
     wal: *wal_mod.WAL,
     heap: *pheap.PersistentHeap,
+    allocator_ref: ?*anyopaque,
+    undo_allocation_fn: ?*const fn (ctx: *anyopaque, offset: u64, size: u64) anyerror!void,
     active_transactions: std.AutoHashMap(u64, Transaction),
     transaction_counter: u64,
     lock: std.Thread.RwLock,
     allocator: std.mem.Allocator,
     max_active_transactions: usize,
+
+    pub fn setAllocatorHook(
+        self: *@This(),
+        ctx: *anyopaque,
+        undo_fn: *const fn (ctx: *anyopaque, offset: u64, size: u64) anyerror!void,
+    ) void {
+        self.allocator_ref = ctx;
+        self.undo_allocation_fn = undo_fn;
+    }
 
     const Self = @This();
 
@@ -150,6 +173,8 @@ pub const TransactionManager = struct {
         self.* = TransactionManager{
             .wal = wal,
             .heap = heap,
+            .allocator_ref = null,
+            .undo_allocation_fn = null,
             .active_transactions = std.AutoHashMap(u64, Transaction).init(allocator_ptr),
             .transaction_counter = 0,
             .lock = std.Thread.RwLock{},
@@ -224,6 +249,14 @@ pub const TransactionManager = struct {
 
         if (tx.wal_tx) |*wal_tx| {
             try self.wal.rollbackTransaction(wal_tx);
+        }
+
+        if (self.undo_allocation_fn) |undo_fn| {
+            if (self.allocator_ref) |ctx| {
+                for (tx.pending_allocations.items) |pa| {
+                    undo_fn(ctx, pa.offset, pa.size) catch {};
+                }
+            }
         }
 
         tx.state = .rolled_back;

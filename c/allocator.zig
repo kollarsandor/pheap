@@ -184,6 +184,30 @@ pub const PersistentAllocator = struct {
         self.allocator.destroy(self);
     }
 
+    pub fn undoAllocation(self: *Self, offset: u64, size: u64) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        if (offset < header.HEADER_SIZE + @sizeOf(AllocatorMetadata)) {
+            return error.InvalidUndo;
+        }
+
+        const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(self.base_addr + offset));
+        if (!obj_header.isFreed()) {
+            obj_header.setFreed(true);
+            obj_header.checksum = obj_header.computeChecksum();
+            try self.heap.flushRange(offset + @sizeOf(header.ObjectHeader));
+        }
+
+        if (self.metadata.allocation_count > 0) {
+            self.metadata.allocation_count -= 1;
+        }
+        if (self.metadata.total_allocated >= size) {
+            self.metadata.total_allocated -= size;
+        }
+        self.metadata.updateChecksum();
+    }
+
     pub fn alloc(self: *Self, size: u64, alignment: u64) !pointer.PersistentPtr {
         self.lock.lock();
         defer self.lock.unlock();
