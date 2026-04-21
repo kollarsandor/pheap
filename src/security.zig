@@ -202,12 +202,8 @@ pub const SecurityManager = struct {
         ad: []const u8,
     ) !void {
         _ = self;
-        _ = plaintext;
-        _ = ciphertext;
-        _ = tag;
-        _ = key;
-        _ = nonce;
-        _ = ad;
+        if (ciphertext.len != plaintext.len) return error.BufferSizeMismatch;
+        crypto.aead.aes_gcm.Aes256Gcm.encrypt(ciphertext, tag, plaintext, ad, nonce, key);
     }
 
     fn decryptAESGCM(
@@ -220,12 +216,8 @@ pub const SecurityManager = struct {
         ad: []const u8,
     ) !void {
         _ = self;
-        _ = ciphertext;
-        _ = plaintext;
-        _ = tag;
-        _ = key;
-        _ = nonce;
-        _ = ad;
+        if (ciphertext.len != plaintext.len) return error.BufferSizeMismatch;
+        try crypto.aead.aes_gcm.Aes256Gcm.decrypt(plaintext, ciphertext, tag.*, ad, nonce, key);
     }
 
     fn encryptChaCha20(
@@ -238,12 +230,8 @@ pub const SecurityManager = struct {
         ad: []const u8,
     ) !void {
         _ = self;
-        _ = plaintext;
-        _ = ciphertext;
-        _ = tag;
-        _ = key;
-        _ = nonce;
-        _ = ad;
+        if (ciphertext.len != plaintext.len) return error.BufferSizeMismatch;
+        crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(ciphertext, tag, plaintext, ad, nonce, key);
     }
 
     fn decryptChaCha20(
@@ -256,12 +244,8 @@ pub const SecurityManager = struct {
         ad: []const u8,
     ) !void {
         _ = self;
-        _ = ciphertext;
-        _ = plaintext;
-        _ = tag;
-        _ = key;
-        _ = nonce;
-        _ = ad;
+        if (ciphertext.len != plaintext.len) return error.BufferSizeMismatch;
+        try crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(plaintext, ciphertext, tag.*, ad, nonce, key);
     }
 
     fn generateNonce(self: *Self, nonce: *[12]u8) void {

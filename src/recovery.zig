@@ -177,8 +177,37 @@ pub const RecoveryEngine = struct {
     }
 
     fn redoRecord(self: *Self, record: *const wal_mod.WALRecord) !void {
-        _ = self;
-        _ = record;
+        switch (record.record_type) {
+            .allocate => {
+                const base_addr = self.heap.getBaseAddress();
+                const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + record.offset));
+                obj_header.setFreed(false);
+                obj_header.checksum = obj_header.computeChecksum();
+                try self.heap.flushRange(record.offset + @sizeOf(header.ObjectHeader));
+            },
+            .write => {
+                const new_data = try self.wal.getUndoData(record);
+                if (new_data.len > 0) {
+                    try self.heap.write(record.offset, new_data);
+                }
+            },
+            .heap_extend => {
+                if (record.size > 0) {
+                    try self.heap.expand(record.size);
+                }
+            },
+            .root_update => {
+                const base_addr = self.heap.getBaseAddress();
+                const root_header: *header.HeapHeader = @ptrCast(@alignCast(base_addr));
+                root_header.root_offset = record.offset;
+                root_header.updateChecksum();
+                try self.heap.flushRange(@sizeOf(header.HeapHeader));
+            },
+            .free_list_add, .free_list_remove => {
+                try self.heap.flushRange(record.offset + record.size);
+            },
+            else => {},
+        }
     }
 
     fn runUndoPhase(self: *Self) !void {

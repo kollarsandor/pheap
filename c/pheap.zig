@@ -267,8 +267,8 @@ pub const PersistentHeap = struct {
     }
 
     pub fn flushRange(self: *PersistentHeap, len: u64) !void {
-        _ = self;
-        _ = len;
+        const clamped = @min(len, self.size);
+        try flushRangeRaw(self.base_addr, clamped);
     }
 
     pub fn sync(self: *PersistentHeap) !void {
