@@ -6,7 +6,7 @@ const allocator_mod = @import("allocator.zig");
 const wal_mod = @import("wal.zig");
 const pheap = @import("pheap.zig");
 
-pub const GC_MAGIC: u32 = 0xGC011ECT;
+pub const GC_MAGIC: u32 = 0x47434F4C;
 pub const GC_VERSION: u32 = 1;
 
 pub const GCStats = struct {
@@ -36,14 +36,14 @@ pub const GCCallbacks = struct {
 
 pub const GCContext = struct {
     gc: *RefCountGC,
-    marked: std.HashMap(u64, void, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
+    marked: std.AutoHashMap(u64, void),
     worklist: std.ArrayList(u64),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator_ptr: std.mem.Allocator) GCContext {
         return .{
             .gc = undefined,
-            .marked = std.HashMap(u64, void, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(allocator_ptr),
+            .marked = std.AutoHashMap(u64, void).init(allocator_ptr),
             .worklist = std.ArrayList(u64).init(allocator_ptr),
             .allocator = allocator_ptr,
         };
@@ -80,7 +80,7 @@ pub const GCOperationDescriptor = extern struct {
     pub const OP_DEC_REF: u32 = 2;
     pub const OP_MARK: u32 = 3;
 
-    pub const DESCRIPTOR_MAGIC: u32 = 0xGCD3SCR;
+    pub const DESCRIPTOR_MAGIC: u32 = 0x47434453;
 
     pub fn init(operation: u32, object_offset: u64, object_size: u64, parent: u64, depth: u32) GCOperationDescriptor {
         return GCOperationDescriptor{
@@ -119,7 +119,7 @@ pub const RefCountGC = struct {
     wal: *wal_mod.WAL,
     heap: *pheap.PersistentHeap,
     stats: GCStats,
-    object_registry: std.HashMap(u64, GCObjectInfo, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
+    object_registry: std.AutoHashMap(u64, GCObjectInfo),
     cycle_breakers: std.ArrayList(pointer.PersistentPtr),
     enabled: atomic.Value(bool),
     lock: std.Thread.Mutex,
@@ -146,7 +146,7 @@ pub const RefCountGC = struct {
                 .gc_cycles = 0,
                 .total_time_ns = 0,
             },
-            .object_registry = std.HashMap(u64, GCObjectInfo, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(allocator_ptr),
+            .object_registry = std.AutoHashMap(u64, GCObjectInfo).init(allocator_ptr),
             .cycle_breakers = std.ArrayList(pointer.PersistentPtr).init(allocator_ptr),
             .enabled = atomic.Value(bool).init(true),
             .lock = std.Thread.Mutex{},
@@ -451,8 +451,8 @@ pub const PartitionedGC = struct {
 pub const GCPartition = struct {
     id: u32,
     size: u64,
-    objects: std.HashMap(u64, GCObjectInfo, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
-    marked: std.HashMap(u64, void, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
+    objects: std.AutoHashMap(u64, GCObjectInfo),
+    marked: std.AutoHashMap(u64, void),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator_ptr: std.mem.Allocator, id: u32, size: u64) !*GCPartition {
@@ -460,8 +460,8 @@ pub const GCPartition = struct {
         self.* = GCPartition{
             .id = id,
             .size = size,
-            .objects = std.HashMap(u64, GCObjectInfo, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(allocator_ptr),
-            .marked = std.HashMap(u64, void, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(allocator_ptr),
+            .objects = std.AutoHashMap(u64, GCObjectInfo).init(allocator_ptr),
+            .marked = std.AutoHashMap(u64, void).init(allocator_ptr),
             .allocator = allocator_ptr,
         };
         return self;

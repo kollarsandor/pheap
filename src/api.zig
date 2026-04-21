@@ -318,7 +318,7 @@ pub fn PersistentMap(comptime K: type, comptime V: type) type {
             };
 
             var prev_offset: u64 = 0;
-            var current_offset_raw = self.store.read(u64, bucket_ptr) catch return null;
+            const current_offset_raw = self.store.read(u64, bucket_ptr) catch return null;
 
             if (current_offset_raw) |current_offset| {
                 var curr = current_offset;
@@ -501,7 +501,7 @@ pub const PersistentStore = struct {
 
         try self.write(ptr, std.mem.asBytes(&value));
 
-        var handle = Handle(T).init(self, ptr);
+        const handle = Handle(T).init(self, ptr);
         return handle;
     }
 

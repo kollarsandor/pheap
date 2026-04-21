@@ -4,7 +4,7 @@ const header = @import("header.zig");
 const pointer = @import("pointer.zig");
 const security = @import("security.zig");
 
-pub const WAL_MAGIC: u32 = 0xWALF1LE;
+pub const WAL_MAGIC: u32 = 0x57414C46;
 pub const WAL_VERSION: u32 = 1;
 pub const WAL_BLOCK_SIZE: u64 = 4096;
 pub const MAX_RECORDS_PER_TRANSACTION: usize = 1024;
@@ -216,12 +216,12 @@ pub const WAL = struct {
 
         const path_copy = try allocator_ptr.dupe(u8, file_path);
 
-        var file = std.fs.cwd().createFile(
+        const file = std.fs.cwd().createFile(
             file_path,
             .{ .read = true, .truncate = false, .exclusive = false },
-        ) catch |err| {
+        ) catch |err| blk: {
             if (err == error.PathAlreadyExists) {
-                file = try std.fs.cwd().openFile(file_path, .{ .read = true, .write = true });
+                break :blk try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
             } else {
                 return err;
             }
@@ -240,7 +240,7 @@ pub const WAL = struct {
             null,
             file_size,
             posix.PROT.READ | posix.PROT.WRITE,
-            posix.MAP.SHARED,
+            .{ .TYPE = .SHARED },
             file.handle,
             0,
         );
@@ -279,7 +279,7 @@ pub const WAL = struct {
             tx.deinit();
         }
 
-        posix.munmap(self.base_addr[0..self.mapped_size]) catch {};
+        posix.munmap(self.base_addr[0..self.mapped_size]);
         self.file.close();
         self.allocator.free(self.file_path);
         self.allocator.destroy(self);
@@ -425,7 +425,7 @@ pub const WAL = struct {
         var transactions = std.ArrayList(Transaction).init(self.allocator);
         errdefer transactions.deinit();
 
-        var offset = @sizeOf(WALHeader);
+        var offset: u64 = @sizeOf(WALHeader);
         var current_tx: ?Transaction = null;
 
         while (offset < self.header.tail_offset) {
@@ -537,7 +537,7 @@ pub const WAL = struct {
     fn expandFile(self: *Self) !void {
         const new_size = self.mapped_size * 2;
 
-        posix.munmap(self.base_addr[0..self.mapped_size]) catch {};
+        posix.munmap(self.base_addr[0..self.mapped_size]);
 
         try self.file.setEndPos(new_size);
 
@@ -545,7 +545,7 @@ pub const WAL = struct {
             null,
             new_size,
             posix.PROT.READ | posix.PROT.WRITE,
-            posix.MAP.SHARED,
+            .{ .TYPE = .SHARED },
             self.file.handle,
             0,
         );

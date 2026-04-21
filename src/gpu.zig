@@ -78,7 +78,7 @@ pub const GPUKernelInfo = struct {
 pub const GPUContext = struct {
     handle: ?*anyopaque,
     config: ?*anyopaque,
-    kernel_library: ?*std.DynLib,
+    kernel_library: ?std.DynLib,
     kernels: std.StringHashMap(GPUKernelInfo),
     allocated_arrays: std.ArrayList(*anyopaque),
     allocator: std.mem.Allocator,
@@ -92,7 +92,7 @@ pub const GPUContext = struct {
         const self = try allocator_ptr.create(GPUContext);
         errdefer allocator_ptr.destroy(self);
 
-        var kernel_lib: ?*std.DynLib = null;
+        var kernel_lib: ?std.DynLib = null;
 
         kernel_lib = std.DynLib.open(kernel_lib_path) catch null;
 
@@ -118,7 +118,7 @@ pub const GPUContext = struct {
     pub fn deinit(self: *Self) void {
         self.freeAllArrays() catch {};
 
-        if (self.kernel_library) |lib| {
+        if (self.kernel_library) |*lib| {
             lib.close();
         }
 
@@ -131,7 +131,7 @@ pub const GPUContext = struct {
         self.allocator.destroy(self);
     }
 
-    fn loadKernelSymbols(self: *Self, lib: *std.DynLib) !void {
+    fn loadKernelSymbols(self: *Self, lib: std.DynLib) !void {
         _ = self;
         _ = lib;
     }
@@ -162,13 +162,11 @@ pub const GPUContext = struct {
 
     pub fn copyToDevice(self: *Self, comptime T: type, arr: *GPUArray(T)) !void {
         _ = self;
-        _ = T;
         _ = arr;
     }
 
     pub fn copyFromDevice(self: *Self, comptime T: type, arr: *GPUArray(T)) !void {
         _ = self;
-        _ = T;
         _ = arr;
     }
 
@@ -185,7 +183,7 @@ pub const GPUContext = struct {
         _ = self.kernels.get(kernel_name) orelse return GPUError.KernelNotFound;
 
         _ = inputs;
-        _ = output_type;
+
 
         switch (output_type) {
             .int32 => return GPUValue{ .int32 = 0 },
@@ -358,14 +356,12 @@ pub const FutharkInterface = struct {
 
     pub fn newArray1D(self: *FutharkInterface, comptime T: type, data: []const T) !?*anyopaque {
         _ = self;
-        _ = T;
         _ = data;
         return null;
     }
 
     pub fn newArray2D(self: *FutharkInterface, comptime T: type, data: []const T, dim0: usize, dim1: usize) !?*anyopaque {
         _ = self;
-        _ = T;
         _ = data;
         _ = dim0;
         _ = dim1;
@@ -374,7 +370,6 @@ pub const FutharkInterface = struct {
 
     pub fn values1D(self: *FutharkInterface, comptime T: type, arr: *anyopaque, out: []T) !void {
         _ = self;
-        _ = T;
         _ = arr;
         _ = out;
     }

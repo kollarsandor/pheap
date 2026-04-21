@@ -302,7 +302,7 @@ pub const PointerTable = struct {
         });
 
         const old_entries = self.entries;
-        const old_capacity = self.capacity;
+        _ = self.capacity;
 
         self.entries = new_entries;
         self.capacity = new_capacity;

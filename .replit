@@ -7,3 +7,26 @@ packages = ["cowsay"]
 
 [agent]
 expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PATH=$HOME/.local/zig:$PATH zig build 2>&1 | tee /tmp/build.log; echo '--- Build done ---'; sleep infinity"
+
+[workflows.workflow.metadata]
+outputType = "console"

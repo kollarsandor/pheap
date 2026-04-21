@@ -1,10 +1,10 @@
 const std = @import("std");
-const pheap = @import("../src/pheap.zig");
-const header = @import("../src/header.zig");
-const allocator_mod = @import("../src/allocator.zig");
-const wal_mod = @import("../src/wal.zig");
-const recovery = @import("../src/recovery.zig");
-const pointer = @import("../src/pointer.zig");
+const pheap = @import("pheap.zig");
+const header = @import("header.zig");
+const allocator_mod = @import("allocator.zig");
+const wal_mod = @import("wal.zig");
+const recovery = @import("recovery.zig");
+const pointer = @import("pointer.zig");
 
 pub const RepairOptions = struct {
     dry_run: bool,
@@ -65,8 +65,8 @@ pub const HeapRepair = struct {
     }
 
     pub fn deinit(self: *HeapRepair) void {
-        for (self.repairs.items) |repair| {
-            self.allocator.free(repair.description);
+        for (self.repairs.items) |action| {
+            self.allocator.free(action.description);
         }
         self.repairs.deinit();
     }
@@ -230,7 +230,7 @@ pub const HeapRepair = struct {
             while (head_offset != 0 and head_offset < self.heap.getSize()) {
                 const node: *allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + head_offset));
 
-                if (node.magic != allocator_mod.FreeListNode.FREE_MAGIC) {
+                if (node.magic != allocator_mod.FreeListNode.NODE_MAGIC) {
                     self.errors_found += 1;
 
                     const desc = try std.fmt.allocPrint(self.allocator, "Invalid free list node at offset {} in class {}", .{ head_offset, i });
@@ -327,7 +327,7 @@ pub const HeapRepair = struct {
                 }
 
                 offset += @sizeOf(header.ObjectHeader) + obj.size;
-            } else if (obj.magic == allocator_mod.FreeListNode.FREE_MAGIC) {
+            } else if (obj.magic == allocator_mod.FreeListNode.NODE_MAGIC) {
                 const free_node: *allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
                 offset += free_node.size;
             } else {
@@ -357,7 +357,7 @@ pub const HeapRepair = struct {
                 const end = offset + @sizeOf(header.ObjectHeader) + obj.size;
                 try allocated_regions.append(.{ .start = offset, .end = end });
                 offset = end;
-            } else if (obj.magic == allocator_mod.FreeListNode.FREE_MAGIC) {
+            } else if (obj.magic == allocator_mod.FreeListNode.NODE_MAGIC) {
                 const free_node: *allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
                 offset += free_node.size;
             } else {
@@ -403,7 +403,7 @@ pub const HeapRepair = struct {
                 }
 
                 offset += @sizeOf(header.ObjectHeader) + obj.size;
-            } else if (obj.magic == allocator_mod.FreeListNode.FREE_MAGIC) {
+            } else if (obj.magic == allocator_mod.FreeListNode.NODE_MAGIC) {
                 const free_node: *allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
                 offset += free_node.size;
             } else if (obj.magic == header.ObjectHeader.OBJECT_MAGIC) {
@@ -527,6 +527,6 @@ pub fn main() !void {
     try stdout.print("Repair Actions:\n", .{});
     for (repair_tool.repairs.items) |repair_action| {
         const status = if (repair_action.fixed) "FIXED" else "NOT FIXED";
-        try stdout.print("  [{}] {}: {s}\n", .{ status, repair_action.offset, repair_action.description });
+        try stdout.print("  [{s}] {}: {s}\n", .{ status, repair_action.offset, repair_action.description });
     }
 }

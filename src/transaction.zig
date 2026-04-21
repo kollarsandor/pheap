@@ -135,7 +135,7 @@ pub const Transaction = struct {
 pub const TransactionManager = struct {
     wal: *wal_mod.WAL,
     heap: *pheap.PersistentHeap,
-    active_transactions: std.HashMap(u64, Transaction, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
+    active_transactions: std.AutoHashMap(u64, Transaction),
     transaction_counter: u64,
     lock: std.Thread.RwLock,
     allocator: std.mem.Allocator,
@@ -150,7 +150,7 @@ pub const TransactionManager = struct {
         self.* = TransactionManager{
             .wal = wal,
             .heap = heap,
-            .active_transactions = std.HashMap(u64, Transaction, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(allocator_ptr),
+            .active_transactions = std.AutoHashMap(u64, Transaction).init(allocator_ptr),
             .transaction_counter = 0,
             .lock = std.Thread.RwLock{},
             .allocator = allocator_ptr,
@@ -171,8 +171,8 @@ pub const TransactionManager = struct {
     }
 
     pub fn begin(self: *Self) !Transaction {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         if (self.active_transactions.count() >= self.max_active_transactions) {
             return error.TooManyActiveTransactions;
@@ -183,7 +183,7 @@ pub const TransactionManager = struct {
 
         const wal_tx = try self.wal.beginTransaction();
 
-        var tx = Transaction.init(self.allocator, id, wal_tx);
+        const tx = Transaction.init(self.allocator, id, wal_tx);
         try self.active_transactions.put(id, tx);
 
         var entry = self.active_transactions.getPtr(id).?;
@@ -193,8 +193,8 @@ pub const TransactionManager = struct {
     }
 
     pub fn commit(self: *Self, tx: *Transaction) !void {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         if (tx.state != .active) {
             return error.TransactionNotActive;
@@ -215,8 +215,8 @@ pub const TransactionManager = struct {
     }
 
     pub fn rollback(self: *Self, tx: *Transaction) !void {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         if (tx.state != .active and tx.state != .failed) {
             return error.TransactionNotActive;
@@ -281,7 +281,7 @@ pub const TransactionManager = struct {
         self.lock.lockShared();
         defer self.lock.unlockShared();
 
-        var op = Operation.init(self.allocator, .allocate, offset, size);
+        const op = Operation.init(self.allocator, .allocate, offset, size);
         try tx.addOperation(op);
 
         if (tx.wal_tx) |*wal_tx| {
@@ -324,8 +324,8 @@ pub const TransactionManager = struct {
     }
 
     pub fn timeoutTransactions(self: *Self, timeout_ms: u64) !usize {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         const current_time = std.time.timestamp();
         var timed_out: usize = 0;

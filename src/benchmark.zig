@@ -155,7 +155,7 @@ pub const BenchmarkSuite = struct {
         const ptr = try alloc.alloc(self.config.object_size, 64);
         defer alloc.free(ptr) catch {};
 
-        var buffer = try self.allocator.alloc(u8, self.config.object_size);
+        const buffer = try self.allocator.alloc(u8, self.config.object_size);
         defer self.allocator.free(buffer);
 
         var times = try self.allocator.alloc(u64, self.config.iterations);
@@ -214,13 +214,13 @@ pub const BenchmarkSuite = struct {
             ptrs[i] = try alloc.alloc(self.config.object_size, 64);
         }
 
-        var buffer = try self.allocator.alloc(u8, self.config.object_size);
+        const buffer = try self.allocator.alloc(u8, self.config.object_size);
         defer self.allocator.free(buffer);
 
         var times = try self.allocator.alloc(u64, self.config.iterations);
         defer self.allocator.free(times);
 
-        const read_count = @as(u64, @floatToInt(@as(f64, @floatFromInt(self.config.batch_size)) * self.config.read_ratio));
+        const read_count: u64 = @intFromFloat(@as(f64, @floatFromInt(self.config.batch_size)) * self.config.read_ratio);
         const write_count = self.config.batch_size - read_count;
 
         var prng = std.rand.DefaultPrng.init(@as(u64, @bitCast(time.timestamp())));
@@ -434,7 +434,7 @@ pub const LatencyHistogram = struct {
     pub fn percentile(self: *const LatencyHistogram, p: f64) u64 {
         if (self.count == 0) return 0;
 
-        const target = @as(u64, @floatToInt(@as(f64, @floatFromInt(self.count)) * p / 100.0));
+        const target: u64 = @intFromFloat(@as(f64, @floatFromInt(self.count)) * p / 100.0);
 
         var cumulative: u64 = 0;
         var bucket_idx: usize = 0;

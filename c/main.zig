@@ -314,7 +314,7 @@ test "allocation and persistence" {
     try runtime.commit(&tx);
 
     var tx2 = try runtime.beginTransaction();
-    const ptr2 = try runtime.allocate(256, 64);
+    _ = try runtime.allocate(256, 64);
     try runtime.commit(&tx2);
 
     const stats = runtime.getStats();

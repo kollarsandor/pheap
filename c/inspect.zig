@@ -1,10 +1,10 @@
 const std = @import("std");
-const pheap = @import("../src/pheap.zig");
-const header = @import("../src/header.zig");
-const allocator_mod = @import("../src/allocator.zig");
-const wal_mod = @import("../src/wal.zig");
-const recovery = @import("../src/recovery.zig");
-const pointer = @import("../src/pointer.zig");
+const pheap = @import("pheap.zig");
+const header = @import("header.zig");
+const allocator_mod = @import("allocator.zig");
+const wal_mod = @import("wal.zig");
+const recovery = @import("recovery.zig");
+const pointer = @import("pointer.zig");
 
 pub const InspectCommand = enum(u8) {
     header,
@@ -140,7 +140,7 @@ pub const HeapInspector = struct {
 
                 found += 1;
                 offset += @sizeOf(header.ObjectHeader) + obj.size;
-            } else if (obj.magic == allocator_mod.FreeListNode.FREE_MAGIC) {
+            } else if (obj.magic == allocator_mod.FreeListNode.NODE_MAGIC) {
                 const free_node: *const allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
                 try writer.print("Free block at offset {}:\n", .{offset});
                 try writer.print("  Size: {} bytes\n", .{free_node.size});
@@ -256,7 +256,7 @@ pub const HeapInspector = struct {
                     valid_objects += 1;
                 }
                 offset += @sizeOf(header.ObjectHeader) + obj.size;
-            } else if (obj.magic == allocator_mod.FreeListNode.FREE_MAGIC) {
+            } else if (obj.magic == allocator_mod.FreeListNode.NODE_MAGIC) {
                 const free_node: *const allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
                 offset += free_node.size;
             } else {

@@ -99,10 +99,10 @@ pub const HKDFParams = struct {
 
 pub const SecurityManager = struct {
     master_key: ?EncryptionKey,
-    region_keys: std.HashMap(u64, EncryptionKey, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
+    region_keys: std.AutoHashMap(u64, EncryptionKey),
     enabled: bool,
     use_hardware_accel: bool,
-    nonce_counter: atomic.Value(u64),
+    nonce_counter: std.atomic.Value(u64),
     allocator: std.mem.Allocator,
     lock: std.Thread.Mutex,
 
@@ -122,10 +122,10 @@ pub const SecurityManager = struct {
 
         return SecurityManager{
             .master_key = master_key,
-            .region_keys = std.HashMap(u64, EncryptionKey, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(allocator_ptr),
+            .region_keys = std.AutoHashMap(u64, EncryptionKey).init(allocator_ptr),
             .enabled = enabled,
             .use_hardware_accel = hasAESNI(),
-            .nonce_counter = atomic.Value(u64).init(0),
+            .nonce_counter = std.atomic.Value(u64).init(0),
             .allocator = allocator_ptr,
             .lock = std.Thread.Mutex{},
         };
@@ -140,7 +140,7 @@ pub const SecurityManager = struct {
 
     pub fn encrypt(self: *Self, plaintext: []const u8, associated_data: []const u8) !EncryptedRegion {
         if (!self.enabled) {
-            var region = EncryptedRegion.init(self.allocator, plaintext.len);
+            const region = EncryptedRegion.init(self.allocator, plaintext.len);
             @memcpy(region.ciphertext, plaintext);
             return region;
         }
@@ -370,7 +370,6 @@ pub const TPM2Interface = struct {
     }
 
     pub fn seal(self: *TPM2Interface, data: []const u8, pcr_mask: u32) ![]u8 {
-        _ = self;
         _ = pcr_mask;
         const sealed = try self.allocator.alloc(u8, data.len + 256);
         @memcpy(sealed[0..data.len], data);
@@ -378,7 +377,6 @@ pub const TPM2Interface = struct {
     }
 
     pub fn unseal(self: *TPM2Interface, sealed_data: []const u8, pcr_mask: u32) ![]u8 {
-        _ = self;
         _ = pcr_mask;
         const unsealed = try self.allocator.alloc(u8, sealed_data.len - 256);
         @memcpy(unsealed, sealed_data[0..unsealed.len]);
@@ -404,9 +402,7 @@ pub const TPM2Interface = struct {
         }
         return true;
     }
-
     pub fn quote(self: *TPM2Interface, qualifying_data: []const u8, pcr_mask: u32) ![]u8 {
-        _ = self;
         _ = pcr_mask;
         const quote_buf = try self.allocator.alloc(u8, qualifying_data.len + 512);
         @memcpy(quote_buf[0..qualifying_data.len], qualifying_data);
@@ -416,7 +412,7 @@ pub const TPM2Interface = struct {
 
 pub const IntegrityVerifier = struct {
     merkle_tree: []MerkleNode,
-    page_hashes: std.HashMap(u64, [32]u8, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage>,
+    page_hashes: std.AutoHashMap(u64, [32]u8),
     allocator: std.mem.Allocator,
 
     const MerkleNode = struct {
@@ -428,7 +424,7 @@ pub const IntegrityVerifier = struct {
     pub fn init(allocator_ptr: std.mem.Allocator) IntegrityVerifier {
         return IntegrityVerifier{
             .merkle_tree = &[_]MerkleNode{},
-            .page_hashes = std.HashMap(u64, [32]u8, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(allocator_ptr),
+            .page_hashes = std.AutoHashMap(u64, [32]u8).init(allocator_ptr),
             .allocator = allocator_ptr,
         };
     }

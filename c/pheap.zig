@@ -53,9 +53,9 @@ pub const PersistentHeap = struct {
         if (needs_init) {
             heap_header.* = header.HeapHeader.init(aligned_size);
             heap_header.setDirty(true);
-            try flushRange(base_addr, @sizeOf(header.HeapHeader));
+            try flushRangeRaw(base_addr, @sizeOf(header.HeapHeader));
             heap_header.setDirty(false);
-            try flushRange(base_addr, @sizeOf(header.HeapHeader));
+            try flushRangeRaw(base_addr, @sizeOf(header.HeapHeader));
         } else {
             try heap_header.validate();
         }
@@ -85,7 +85,7 @@ pub const PersistentHeap = struct {
 
     pub fn deinit(self: *PersistentHeap) void {
         self.flush() catch {};
-        unmapFile(self.base_addr, self.size) catch {};
+        unmapFile(self.base_addr, self.size);
         self.file.close();
         self.allocator.free(self.dirty_pages);
         self.allocator.free(self.file_path);
@@ -349,7 +349,7 @@ fn openOrCreateFile(path: []const u8, size: u64) !std.fs.File {
         .{ .read = true, .truncate = false, .exclusive = false },
     ) catch |err| {
         if (err == error.PathAlreadyExists) {
-            return std.fs.cwd().openFile(path, .{ .read = true, .write = true });
+            return std.fs.cwd().openFile(path, .{ .mode = .read_write });
         }
         return err;
     };
@@ -362,21 +362,28 @@ fn mapFile(fd: posix.fd_t, size: u64) ![*]align(std.mem.page_size) u8 {
     const ptr = try posix.mmap(
         null,
         size,
-        MMAP_PROT,
-        MMAP_FLAGS,
+        posix.PROT.READ | posix.PROT.WRITE,
+        .{ .TYPE = .SHARED },
         fd,
         0,
     );
     return @ptrCast(@alignCast(ptr.ptr));
 }
 
-fn unmapFile(base_addr: [*]align(std.mem.page_size) u8, size: u64) !void {
+fn unmapFile(base_addr: [*]align(std.mem.page_size) u8, size: u64) void {
     posix.munmap(base_addr[0..size]);
 }
 
-fn flushRange(base_addr: [*]u8, len: u64) !void {
-    _ = base_addr;
-    _ = len;
+fn flushRangeRaw(base_addr: [*]u8, len: u64) !void {
+    const page_size = std.mem.page_size;
+    const addr_int = @intFromPtr(base_addr);
+    const page_aligned = addr_int & ~@as(usize, page_size - 1);
+    const offset_into_page = addr_int - page_aligned;
+    const total_len = len + offset_into_page;
+    const aligned_len = (total_len + page_size - 1) & ~@as(usize, page_size - 1);
+
+    const aligned_ptr: [*]align(std.mem.page_size) u8 = @ptrFromInt(page_aligned);
+    try posix.msync(aligned_ptr[0..aligned_len], posix.MSF.SYNC);
 }
 
 test "heap initialization" {

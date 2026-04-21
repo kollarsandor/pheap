@@ -3,7 +3,7 @@ const atomic = std.atomic;
 const header = @import("header.zig");
 const wal_mod = @import("wal.zig");
 
-pub const LOCK_MAGIC: u32 = 0xL0CK0001;
+pub const LOCK_MAGIC: u32 = 0x4C4F434B;
 pub const LOCK_VERSION: u32 = 1;
 
 pub const PMutex = extern struct {

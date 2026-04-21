@@ -40,8 +40,8 @@ pub const RecoveryEngine = struct {
     phase: RecoveryPhase,
     stats: RecoveryStats,
     allocator: std.mem.Allocator,
-    incomplete_transactions: std.HashMap(u64, wal_mod.Transaction, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
-    committed_transactions: std.HashMap(u64, wal_mod.Transaction, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
+    incomplete_transactions: std.AutoHashMap(u64, wal_mod.Transaction),
+    committed_transactions: std.AutoHashMap(u64, wal_mod.Transaction),
     last_checkpoint: u64,
 
     const Self = @This();
@@ -62,8 +62,8 @@ pub const RecoveryEngine = struct {
                 .end_time = 0,
             },
             .allocator = heap.allocator,
-            .incomplete_transactions = std.HashMap(u64, wal_mod.Transaction, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(heap.allocator),
-            .committed_transactions = std.HashMap(u64, wal_mod.Transaction, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(heap.allocator),
+            .incomplete_transactions = std.AutoHashMap(u64, wal_mod.Transaction).init(heap.allocator),
+            .committed_transactions = std.AutoHashMap(u64, wal_mod.Transaction).init(heap.allocator),
             .last_checkpoint = 0,
         };
     }
@@ -146,7 +146,7 @@ pub const RecoveryEngine = struct {
                     try self.committed_transactions.put(tx.id, tx);
                     self.stats.transactions_committed += 1;
                 },
-                .active => {
+                .active, .prepared => {
                     try self.incomplete_transactions.put(tx.id, tx);
                 },
                 .rolled_back => {},
@@ -186,7 +186,7 @@ pub const RecoveryEngine = struct {
 
         var iter = self.incomplete_transactions.iterator();
         while (iter.next()) |entry| {
-            var tx = entry.value_ptr;
+            const tx = entry.value_ptr;
             try self.undoTransaction(tx);
             self.stats.transactions_rolled_back += 1;
         }
@@ -307,7 +307,7 @@ pub const CrashSimulator = struct {
         try self.crash_points.append(point);
     }
 
-    pub fn shouldCrash(self: *Self) bool {
+    pub fn shouldCrash(self: *CrashSimulator) bool {
         if (self.current_point < self.crash_points.items.len) {
             const point = self.crash_points.items[self.current_point];
             self.current_point += 1;
@@ -316,7 +316,7 @@ pub const CrashSimulator = struct {
         return false;
     }
 
-    pub fn reset(self: *Self) void {
+    pub fn reset(self: *CrashSimulator) void {
         self.current_point = 0;
     }
 };

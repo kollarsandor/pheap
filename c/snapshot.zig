@@ -4,7 +4,7 @@ const header = @import("header.zig");
 const pheap = @import("pheap.zig");
 const pointer = @import("pointer.zig");
 
-pub const SNAPSHOT_MAGIC: u32 = 0xSNAPSHOT;
+pub const SNAPSHOT_MAGIC: u32 = 0x534E5053;
 pub const SNAPSHOT_VERSION: u32 = 1;
 
 pub const SnapshotHeader = extern struct {
@@ -86,7 +86,7 @@ pub const MerkleNode = extern struct {
 pub const DirtyPageTracker = struct {
     bitmap: []u64,
     page_count: u64,
-    dirty_count: atomic.Value(u64),
+    dirty_count: std.atomic.Value(u64),
     protected: []bool,
     base_addr: [*]const u8,
     page_size: u64,
@@ -106,7 +106,7 @@ pub const DirtyPageTracker = struct {
         return DirtyPageTracker{
             .bitmap = bitmap,
             .page_count = page_count,
-            .dirty_count = atomic.Value(u64).init(0),
+            .dirty_count = std.atomic.Value(u64).init(0),
             .protected = protected,
             .base_addr = base_addr,
             .page_size = std.mem.page_size,
@@ -200,7 +200,7 @@ pub const SnapshotManager = struct {
     snapshot_dir: ?[]const u8,
     snapshots: std.ArrayList(SnapshotInfo),
     dirty_tracker: DirtyPageTracker,
-    next_snapshot_id: atomic.Value(u64),
+    next_snapshot_id: std.atomic.Value(u64),
     allocator: std.mem.Allocator,
     lock: std.Thread.RwLock,
     merkle_tree: []MerkleNode,
@@ -221,7 +221,7 @@ pub const SnapshotManager = struct {
 
         const dirty_tracker = try DirtyPageTracker.init(allocator_ptr, heap.getSize(), heap.getBaseAddress());
 
-        var snapshots = std.ArrayList(SnapshotInfo).init(allocator_ptr);
+        const snapshots = std.ArrayList(SnapshotInfo).init(allocator_ptr);
 
         if (snapshot_dir) |dir| {
             std.fs.cwd().makePath(dir) catch {};
@@ -232,7 +232,7 @@ pub const SnapshotManager = struct {
             .snapshot_dir = snapshot_dir,
             .snapshots = snapshots,
             .dirty_tracker = dirty_tracker,
-            .next_snapshot_id = atomic.Value(u64).init(1),
+            .next_snapshot_id = std.atomic.Value(u64).init(1),
             .allocator = allocator_ptr,
             .lock = std.Thread.RwLock{},
             .merkle_tree = &[_]MerkleNode{},
@@ -255,8 +255,8 @@ pub const SnapshotManager = struct {
     }
 
     pub fn createSnapshot(self: *Self) !u64 {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         const snapshot_id = self.next_snapshot_id.fetchAdd(1, .monotonic);
 
@@ -342,8 +342,8 @@ pub const SnapshotManager = struct {
     }
 
     pub fn restoreSnapshot(self: *Self, snapshot_id: u64) !void {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         const info = self.findSnapshot(snapshot_id) orelse return error.SnapshotNotFound;
 
@@ -363,7 +363,7 @@ pub const SnapshotManager = struct {
         try loaded_header.validate();
 
         const bitmap_size_words = (loaded_header.page_count + 63) / 64;
-        var bitmap = try self.allocator.alloc(u64, bitmap_size_words);
+        const bitmap = try self.allocator.alloc(u64, bitmap_size_words);
         defer self.allocator.free(bitmap);
 
         _ = try snapshot_file.readAll(std.mem.sliceAsBytes(bitmap));
@@ -390,8 +390,8 @@ pub const SnapshotManager = struct {
     }
 
     pub fn deleteSnapshot(self: *Self, snapshot_id: u64) !void {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         var idx: usize = 0;
         while (idx < self.snapshots.items.len) : (idx += 1) {

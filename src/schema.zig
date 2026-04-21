@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const SchemaMagic: u32 = 0xSCHEMA01;
+pub const SchemaMagic: u32 = 0x53434841;
 pub const SchemaVersion: u32 = 1;
 
 pub const FieldKind = enum(u8) {
@@ -60,10 +60,10 @@ pub const Migration = struct {
 };
 
 pub const SchemaRegistry = struct {
-    entries: std.HashMap(u32, SchemaEntry, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
+    entries: std.AutoHashMap(u32, SchemaEntry),
     name_index: std.StringHashMap(u32),
-    migrations: std.HashMap(u64, Migration, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage),
-    next_schema_id: atomic.Value(u32),
+    migrations: std.AutoHashMap(u64, Migration),
+    next_schema_id: std.atomic.Value(u32),
     string_pool: std.ArrayList(u8),
     allocator: std.mem.Allocator,
     lock: std.Thread.RwLock,
@@ -72,10 +72,10 @@ pub const SchemaRegistry = struct {
 
     pub fn init(allocator_ptr: std.mem.Allocator) SchemaRegistry {
         return SchemaRegistry{
-            .entries = std.HashMap(u32, SchemaEntry, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(allocator_ptr),
+            .entries = std.AutoHashMap(u32, SchemaEntry).init(allocator_ptr),
             .name_index = std.StringHashMap(u32).init(allocator_ptr),
-            .migrations = std.HashMap(u64, Migration, std.hash_map.DefaultHashContext, std.hash_map.default_max_load_percentage).init(allocator_ptr),
-            .next_schema_id = atomic.Value(u32).init(1),
+            .migrations = std.AutoHashMap(u64, Migration).init(allocator_ptr),
+            .next_schema_id = std.atomic.Value(u32).init(1),
             .string_pool = std.ArrayList(u8).init(allocator_ptr),
             .allocator = allocator_ptr,
             .lock = std.Thread.RwLock{},
@@ -100,8 +100,8 @@ pub const SchemaRegistry = struct {
         comptime T: type,
         name: []const u8,
     ) !u32 {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         if (self.name_index.get(name)) |existing_id| {
             return existing_id;
@@ -133,7 +133,7 @@ pub const SchemaRegistry = struct {
         var fields = std.ArrayList(FieldInfo).init(self.allocator);
         errdefer fields.deinit();
 
-        inline for (struct_info.fields, 0..) |field, idx| {
+        inline for (struct_info.fields) |field| {
             const field_name = field.name;
             const field_name_offset = self.string_pool.items.len;
 
@@ -240,8 +240,8 @@ pub const SchemaRegistry = struct {
         to_schema_id: u32,
         migration_fn: MigrationFn,
     ) !void {
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         const key = (@as(u64, from_schema_id) << 32) | @as(u64, to_schema_id);
 
@@ -402,7 +402,7 @@ pub const SchemaRegistry = struct {
         const fields_ptr: [*]const FieldInfo = @ptrCast(@alignCast(data.ptr + @sizeOf(StructInfo)));
         const fields = fields_ptr[0..info.field_count];
 
-        var name_offset = @sizeOf(StructInfo) + fields_size;
+        const name_offset = @sizeOf(StructInfo) + fields_size;
         if (data.len < name_offset + info.name_len) {
             return error.DataTooSmall;
         }
@@ -419,8 +419,8 @@ pub const SchemaRegistry = struct {
             .type_name = try self.allocator.dupe(u8, name),
         };
 
-        self.lock.lockExclusive();
-        defer self.lock.unlockExclusive();
+        self.lock.lock();
+        defer self.lock.unlock();
 
         try self.entries.put(schema_id, entry);
         try self.name_index.put(entry.name, schema_id);

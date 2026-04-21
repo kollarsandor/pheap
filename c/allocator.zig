@@ -26,7 +26,7 @@ pub const AllocatorMetadata = extern struct {
     checksum: u32,
     reserved: [36]u8,
 
-    pub const ALLOCATOR_MAGIC: u32 = 0xALL0CA7E;
+    pub const ALLOCATOR_MAGIC: u32 = 0x414C4F43;
 
     pub fn init() AllocatorMetadata {
         return AllocatorMetadata{
@@ -52,7 +52,7 @@ pub const AllocatorMetadata = extern struct {
         self.checksum = self.computeChecksum();
     }
 
-    fn computeChecksum(self: *const AllocatorMetadata) u32 {
+    pub fn computeChecksum(self: *const AllocatorMetadata) u32 {
         const bytes = std.mem.asBytes(self);
         var crc: u32 = 0xFFFFFFFF;
         for (bytes[0..@offsetOf(AllocatorMetadata, "checksum")]) |byte| {
@@ -66,7 +66,7 @@ pub const AllocatorMetadata = extern struct {
         var c = crc ^ @as(u32, byte);
         var j: usize = 0;
         while (j < 8) : (j += 1) {
-            if (c & 1) != 0 {
+            if ((c & 1) != 0) {
                 c = (c >> 1) ^ POLY;
             } else {
                 c = c >> 1;
@@ -84,7 +84,7 @@ pub const FreeListNode = extern struct {
     checksum: u32,
     reserved: u32,
 
-    pub const NODE_MAGIC: u32 = 0xFREEL1ST;
+    pub const NODE_MAGIC: u32 = 0x46524545;
 
     pub fn init(size: u64) FreeListNode {
         return FreeListNode{
@@ -149,7 +149,7 @@ pub const PersistentAllocator = struct {
                 .free_list_offset = 0,
                 .count = 0,
             };
-            current_size = @as(u64, @floatToInt(@ceil(@as(f64, @floatFromInt(current_size)) * 1.25)));
+            current_size = @as(u64, @intFromFloat(@ceil(@as(f64, @floatFromInt(current_size)) * 1.25)));
         }
 
         var free_list_heads: [NUM_SIZE_CLASSES]u64 = undefined;

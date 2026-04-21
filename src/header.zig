@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 pub const HEAP_MAGIC = "ZIGPHEAP";
 pub const HEAP_VERSION: u32 = 1;
-pub const HEADER_SIZE: u64 = 64;
+pub const HEADER_SIZE: u64 = 256;
 pub const CACHE_LINE_SIZE: u64 = 64;
 
 pub const Endianness = enum(u32) {
@@ -28,7 +28,7 @@ pub const HeapHeader = extern struct {
     allocator_offset: u64 align(8),
     transaction_id: u64 align(8),
     last_checkpoint: u64 align(8),
-    reserved2: [64 - 136]u8 align(8),
+    reserved2: [256 - 112]u8 align(8),
 
     pub fn init(heap_size: u64) HeapHeader {
         var uuid_low: u64 = undefined;
@@ -48,7 +48,7 @@ pub const HeapHeader = extern struct {
             .flags = 0,
             .pool_uuid_low = uuid_low,
             .pool_uuid_high = uuid_high,
-            .endianness = if (builtin.endian == .little) Endianness.little else Endianness.big,
+            .endianness = if (builtin.cpu.arch.endian() == .little) Endianness.little else Endianness.big,
             .checksum = 0,
             .reserved1 = 0,
             .heap_size = heap_size,
@@ -59,7 +59,7 @@ pub const HeapHeader = extern struct {
             .allocator_offset = 0,
             .transaction_id = 0,
             .last_checkpoint = 0,
-            .reserved2 = [_]u8{0} ** (64 - 136),
+            .reserved2 = [_]u8{0} ** (256 - 112),
         };
 
         header.checksum = header.computeChecksum();
@@ -91,7 +91,7 @@ pub const HeapHeader = extern struct {
         var c = crc ^ @as(u32, byte);
         var j: usize = 0;
         while (j < 8) : (j += 1) {
-            if (c & 1) != 0 {
+            if ((c & 1) != 0) {
                 c = (c >> 1) ^ POLY;
             } else {
                 c = c >> 1;
@@ -109,7 +109,7 @@ pub const HeapHeader = extern struct {
             return error.UnsupportedVersion;
         }
 
-        const expected_endianness = if (builtin.endian == .little) Endianness.little else Endianness.big;
+        const expected_endianness = if (builtin.cpu.arch.endian() == .little) Endianness.little else Endianness.big;
         if (self.endianness != expected_endianness) {
             return error.EndiannessMismatch;
         }
@@ -199,7 +199,7 @@ pub const ObjectHeader = extern struct {
     }
 
     pub fn isPinned(self: *const ObjectHeader) bool {
-        return (self.flags & FLAG_PINN) != 0;
+        return (self.flags & FLAG_PINNED) != 0;
     }
 
     pub fn isArray(self: *const ObjectHeader) bool {
@@ -241,7 +241,7 @@ pub const ObjectHeader = extern struct {
         var c = crc ^ @as(u32, byte);
         var j: usize = 0;
         while (j < 8) : (j += 1) {
-            if (c & 1) != 0 {
+            if ((c & 1) != 0) {
                 c = (c >> 1) ^ POLY;
             } else {
                 c = c >> 1;
@@ -299,7 +299,7 @@ pub const FreeBlock = extern struct {
         var c = crc ^ @as(u32, byte);
         var j: usize = 0;
         while (j < 8) : (j += 1) {
-            if (c & 1) != 0 {
+            if ((c & 1) != 0) {
                 c = (c >> 1) ^ POLY;
             } else {
                 c = c >> 1;
