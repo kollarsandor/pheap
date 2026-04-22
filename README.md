@@ -1,4 +1,7 @@
-pheap áttekintés
+pheap – Teljes dokumentáció (Magyar)
+
+Forrás: https://deepwiki.com/kollarsandor/pheap > Generálva: 2026-04-22
+
 
 A pheap egy perzisztens kupactároló motor, amelyet arra terveztek, hogy ACID-kompatibilis, tranzakcionális memóriakezelést biztosítson olyan alkalmazások számára, amelyek tartós adatstruktúrákat igényelnek. Az in-memory allokáció teljesítményét egy lemezalapú tárolórendszer perzisztenciájával ötvözi, előreíró naplót és robusztus helyreállító motort használva az adatintegritás biztosítására összeomlások esetén.
 
