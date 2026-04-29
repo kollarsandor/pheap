@@ -1,4 +1,3 @@
-```zig
 const std = @import("std");
 const wal_mod = @import("wal.zig");
 const pheap = @import("pheap.zig");
