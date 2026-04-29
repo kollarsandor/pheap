@@ -1,10 +1,24 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const HEAP_MAGIC = "ZIGPHEAP";
+pub const HEAP_MAGIC = [8]u8{ 'Z', 'I', 'G', 'P', 'H', 'E', 'A', 'P' };
 pub const HEAP_VERSION: u32 = 1;
 pub const HEADER_SIZE: u64 = 256;
 pub const CACHE_LINE_SIZE: u64 = 64;
+
+fn crc32cByte(crc: u32, byte: u8) u32 {
+    const POLY: u32 = 0x82F63B78;
+    var c = crc ^ @as(u32, byte);
+    var j: usize = 0;
+    while (j < 8) : (j += 1) {
+        if ((c & 1) != 0) {
+            c = (c >> 1) ^ POLY;
+        } else {
+            c = c >> 1;
+        }
+    }
+    return c;
+}
 
 pub const Endianness = enum(u32) {
     little = 0x01234567,
@@ -34,16 +48,16 @@ pub const HeapHeader = extern struct {
         var uuid_low: u64 = undefined;
         var uuid_high: u64 = undefined;
 
-        var seed: u64 = @as(u64, @bitCast(std.time.timestamp()));
+        var seed: u64 = @bitCast(u64, std.time.timestamp());
         seed ^= @as(u64, @intFromPtr(&heap_size));
-        
+
         var prng = std.rand.DefaultPrng.init(seed);
         const rand = prng.random();
         uuid_low = rand.int(u64);
         uuid_high = rand.int(u64);
 
         var header = HeapHeader{
-            .magic = HEAP_MAGIC.*,
+            .magic = HEAP_MAGIC,
             .version = HEAP_VERSION,
             .flags = 0,
             .pool_uuid_low = uuid_low,
@@ -70,38 +84,24 @@ pub const HeapHeader = extern struct {
         const bytes = std.mem.asBytes(self);
         const checksum_offset = @offsetOf(HeapHeader, "checksum");
         const checksum_size = @sizeOf(u32);
-        
+
         var crc: u32 = 0xFFFFFFFF;
-        
+
         var i: usize = 0;
         while (i < checksum_offset) : (i += 1) {
             crc = crc32cByte(crc, bytes[i]);
         }
-        
+
         i = checksum_offset + checksum_size;
         while (i < bytes.len) : (i += 1) {
             crc = crc32cByte(crc, bytes[i]);
         }
-        
+
         return crc ^ 0xFFFFFFFF;
     }
 
-    fn crc32cByte(crc: u32, byte: u8) u32 {
-        const POLY: u32 = 0x82F63B78;
-        var c = crc ^ @as(u32, byte);
-        var j: usize = 0;
-        while (j < 8) : (j += 1) {
-            if ((c & 1) != 0) {
-                c = (c >> 1) ^ POLY;
-            } else {
-                c = c >> 1;
-            }
-        }
-        return c;
-    }
-
     pub fn validate(self: *const HeapHeader) !void {
-        if (!std.mem.eql(u8, &self.magic, HEAP_MAGIC)) {
+        if (!std.mem.eql(u8, self.magic[0..], HEAP_MAGIC[0..])) {
             return error.InvalidMagic;
         }
 
@@ -161,6 +161,10 @@ pub const HeapHeader = extern struct {
         }
     }
 };
+
+comptime {
+    if (@sizeOf(HeapHeader) != HEADER_SIZE) @compileError("HeapHeader size does not match HEADER_SIZE");
+}
 
 pub const ObjectHeader = extern struct {
     magic: u32,
@@ -227,27 +231,13 @@ pub const ObjectHeader = extern struct {
         var crc: u32 = 0xFFFFFFFF;
         const skip_start = @offsetOf(ObjectHeader, "checksum");
         const skip_end = skip_start + @sizeOf(u32);
-        
+
         for (bytes, 0..) |byte, i| {
             if (i >= skip_start and i < skip_end) continue;
             crc = crc32cByte(crc, byte);
         }
-        
-        return crc ^ 0xFFFFFFFF;
-    }
 
-    fn crc32cByte(crc: u32, byte: u8) u32 {
-        const POLY: u32 = 0x82F63B78;
-        var c = crc ^ @as(u32, byte);
-        var j: usize = 0;
-        while (j < 8) : (j += 1) {
-            if ((c & 1) != 0) {
-                c = (c >> 1) ^ POLY;
-            } else {
-                c = c >> 1;
-            }
-        }
-        return c;
+        return crc ^ 0xFFFFFFFF;
     }
 };
 
@@ -285,34 +275,20 @@ pub const FreeBlock = extern struct {
         var crc: u32 = 0xFFFFFFFF;
         const skip_start = @offsetOf(FreeBlock, "checksum");
         const skip_end = skip_start + @sizeOf(u32);
-        
+
         for (bytes, 0..) |byte, i| {
             if (i >= skip_start and i < skip_end) continue;
             crc = crc32cByte(crc, byte);
         }
-        
-        return crc ^ 0xFFFFFFFF;
-    }
 
-    fn crc32cByte(crc: u32, byte: u8) u32 {
-        const POLY: u32 = 0x82F63B78;
-        var c = crc ^ @as(u32, byte);
-        var j: usize = 0;
-        while (j < 8) : (j += 1) {
-            if ((c & 1) != 0) {
-                c = (c >> 1) ^ POLY;
-            } else {
-                c = c >> 1;
-            }
-        }
-        return c;
+        return crc ^ 0xFFFFFFFF;
     }
 };
 
 test "header initialization and validation" {
     const testing = std.testing;
     var header = HeapHeader.init(1024 * 1024);
-    try testing.expect(std.mem.eql(u8, &header.magic, HEAP_MAGIC));
+    try testing.expect(std.mem.eql(u8, header.magic[0..], HEAP_MAGIC[0..]));
     try testing.expect(header.version == HEAP_VERSION);
     try header.validate();
 }
