@@ -11,7 +11,6 @@ pub const InspectCommand = enum(u8) {
     stats,
     objects,
     wal,
-    tree,
     all,
 };
 
@@ -42,7 +41,7 @@ pub const HeapInspector = struct {
     }
 
     pub fn inspectHeader(self: *HeapInspector) !InspectResult {
-        const hdr = self.heap.header;
+        const hdr = &self.heap.header;
 
         var buffer = std.ArrayList(u8).init(self.allocator);
         defer buffer.deinit();
@@ -77,22 +76,28 @@ pub const HeapInspector = struct {
 
     pub fn inspectStats(self: *HeapInspector) !InspectResult {
         const base_addr = self.heap.getBaseAddress();
-        const metadata: *allocator_mod.AllocatorMetadata = @ptrCast(@alignCast(base_addr + header.HEADER_SIZE));
+        const metadata: *const allocator_mod.AllocatorMetadata = @ptrCast(@alignCast(base_addr + header.HEADER_SIZE));
 
         var buffer = std.ArrayList(u8).init(self.allocator);
         defer buffer.deinit();
 
         const writer = buffer.writer();
 
+        const in_use_bytes: u64 = if (metadata.total_allocated >= metadata.total_freed)
+            metadata.total_allocated - metadata.total_freed
+        else
+            0;
+
         try writer.print("=== Allocation Statistics ===\n", .{});
         try writer.print("Total Allocated: {} bytes\n", .{metadata.total_allocated});
         try writer.print("Total Freed: {} bytes\n", .{metadata.total_freed});
-        try writer.print("In-Use: {} bytes\n", .{metadata.total_allocated - metadata.total_freed});
+        try writer.print("In-Use: {} bytes\n", .{in_use_bytes});
         try writer.print("Allocation Count: {}\n", .{metadata.allocation_count});
         try writer.print("Free Count: {}\n", .{metadata.free_count});
 
-        const utilization = if (self.heap.getSize() > 0)
-            @as(f64, @floatFromInt(metadata.total_allocated - metadata.total_freed)) / @as(f64, @floatFromInt(self.heap.getSize())) * 100.0
+        const heap_size = self.heap.getSize();
+        const utilization = if (heap_size > 0)
+            @as(f64, @floatFromInt(in_use_bytes)) / @as(f64, @floatFromInt(heap_size)) * 100.0
         else
             0.0;
 
@@ -123,11 +128,12 @@ pub const HeapInspector = struct {
         var found: u64 = 0;
         var offset = start_offset;
 
-        if (offset < header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata)) {
-            offset = header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata);
+        const objects_start = header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata);
+        if (offset < objects_start) {
+            offset = objects_start;
         }
 
-        while (found < count and offset < heap_size - @sizeOf(header.ObjectHeader)) {
+        while (found < count and offset + @sizeOf(header.ObjectHeader) <= heap_size) {
             const obj: *const header.ObjectHeader = @ptrCast(@alignCast(base_addr + offset));
 
             if (obj.magic == header.ObjectHeader.OBJECT_MAGIC) {
@@ -139,15 +145,29 @@ pub const HeapInspector = struct {
                 try writer.print("  Pinned: {}\n", .{obj.isPinned()});
 
                 found += 1;
-                offset += @sizeOf(header.ObjectHeader) + obj.size;
+
+                const advance_result = @addWithOverflow(@as(u64, @sizeOf(header.ObjectHeader)), obj.size);
+                const advance = advance_result[0];
+                if (advance_result[1] != 0 or advance == 0 or offset + advance > heap_size) {
+                    break;
+                }
+                offset += advance;
             } else if (obj.magic == allocator_mod.FreeListNode.NODE_MAGIC) {
                 const free_node: *const allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
                 try writer.print("Free block at offset {}:\n", .{offset});
                 try writer.print("  Size: {} bytes\n", .{free_node.size});
 
-                offset += free_node.size;
+                const free_size = free_node.size;
+                if (free_size == 0 or offset + free_size > heap_size) {
+                    break;
+                }
+                offset += free_size;
             } else {
-                offset += 64;
+                const next_offset = offset + 64;
+                if (next_offset <= offset or next_offset > heap_size) {
+                    break;
+                }
+                offset = next_offset;
             }
         }
 
@@ -217,26 +237,30 @@ pub const HeapInspector = struct {
         try writer.print("=== Heap Validation ===\n", .{});
 
         var errors: u64 = 0;
+        var header_ok = true;
+        var metadata_ok = true;
 
         self.heap.header.validate() catch |err| {
             try writer.print("Header validation error: {}\n", .{err});
             errors += 1;
+            header_ok = false;
         };
 
-        if (errors == 0) {
+        if (header_ok) {
             try writer.print("Header: OK\n", .{});
         }
 
         const base_addr = self.heap.getBaseAddress();
-        const metadata: *allocator_mod.AllocatorMetadata = @ptrCast(@alignCast(base_addr + header.HEADER_SIZE));
+        const metadata: *const allocator_mod.AllocatorMetadata = @ptrCast(@alignCast(base_addr + header.HEADER_SIZE));
 
         metadata.validate() catch |err| {
             try writer.print("Allocator metadata validation error: {}\n", .{err});
             errors += 1;
+            metadata_ok = false;
         };
 
-        if (errors == 0) {
-            try writer.print("Allocator Metadata: OK\n", .{});
+        if (metadata_ok) {
+            try writer.print("Allocator Meta: OK\n", .{});
         }
 
         var offset = header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata);
@@ -245,7 +269,7 @@ pub const HeapInspector = struct {
         var valid_objects: u64 = 0;
         var invalid_objects: u64 = 0;
 
-        while (offset < heap_size - @sizeOf(header.ObjectHeader)) {
+        while (offset + @sizeOf(header.ObjectHeader) <= heap_size) {
             const obj: *const header.ObjectHeader = @ptrCast(@alignCast(base_addr + offset));
 
             if (obj.magic == header.ObjectHeader.OBJECT_MAGIC) {
@@ -255,12 +279,26 @@ pub const HeapInspector = struct {
                 } else {
                     valid_objects += 1;
                 }
-                offset += @sizeOf(header.ObjectHeader) + obj.size;
+
+                const advance_result = @addWithOverflow(@as(u64, @sizeOf(header.ObjectHeader)), obj.size);
+                const advance = advance_result[0];
+                if (advance_result[1] != 0 or advance == 0 or offset + advance > heap_size) {
+                    break;
+                }
+                offset += advance;
             } else if (obj.magic == allocator_mod.FreeListNode.NODE_MAGIC) {
                 const free_node: *const allocator_mod.FreeListNode = @ptrCast(@alignCast(base_addr + offset));
-                offset += free_node.size;
+                const free_size = free_node.size;
+                if (free_size == 0 or offset + free_size > heap_size) {
+                    break;
+                }
+                offset += free_size;
             } else {
-                offset += 64;
+                const next_offset = offset + 64;
+                if (next_offset <= offset or next_offset > heap_size) {
+                    break;
+                }
+                offset = next_offset;
             }
         }
 
@@ -289,7 +327,7 @@ pub fn printUsage() void {
     stdout.print("  objects   List objects in heap\n", .{}) catch {};
     stdout.print("  wal       Inspect WAL file\n", .{}) catch {};
     stdout.print("  validate  Validate heap integrity\n", .{}) catch {};
-    stdout.print("  all       Full inspection\n", .{}) catch {};
+    stdout.print("  all       Full validation (same as 'validate')\n", .{}) catch {};
     stdout.print("\nOptions:\n", .{}) catch {};
     stdout.print("  --wal <path>       Path to WAL file\n", .{}) catch {};
     stdout.print("  --offset <n>       Starting offset for object listing\n", .{}) catch {};
@@ -335,16 +373,10 @@ pub fn main() !void {
     };
     defer inspector.deinit();
 
-    var result: InspectResult = undefined;
-
-    switch (command) {
-        .header => {
-            result = try inspector.inspectHeader();
-        },
-        .stats => {
-            result = try inspector.inspectStats();
-        },
-        .objects => {
+    const result = switch (command) {
+        .header => try inspector.inspectHeader(),
+        .stats => try inspector.inspectStats(),
+        .objects => blk: {
             var start_offset: u64 = 0;
             var count: u64 = 100;
 
@@ -359,9 +391,9 @@ pub fn main() !void {
                 }
             }
 
-            result = try inspector.inspectObjects(start_offset, count);
+            break :blk try inspector.inspectObjects(start_offset, count);
         },
-        .wal => {
+        .wal => blk: {
             var wal_path: ?[]const u8 = null;
             var i: usize = 3;
             while (i < args.len) : (i += 1) {
@@ -372,17 +404,14 @@ pub fn main() !void {
             }
 
             if (wal_path) |wp| {
-                result = try inspector.inspectWAL(wp);
+                break :blk try inspector.inspectWAL(wp);
             } else {
                 std.debug.print("WAL path required for wal command\n", .{});
                 return;
             }
         },
-        .all => {
-            result = try inspector.validateHeap();
-        },
-        else => {},
-    }
+        .all => try inspector.validateHeap(),
+    };
 
     std.debug.print("{s}\n", .{result.message});
 
