@@ -38,7 +38,6 @@ pub const RecoveryError = error{
     IncompleteTransaction,
     InvalidRecord,
     HeapCorruption,
-    CheckpointNotFound,
     UndoFailed,
     RedoFailed,
     DuplicateTransactionId,
@@ -241,8 +240,8 @@ pub const RecoveryEngine = struct {
             transactions.deinit();
         }
 
-        for (transactions.items) |tx| {
-            const lsn = self.wal.getTransactionLsn(&tx) catch {
+        for (transactions.items) |*tx| {
+            const lsn = self.wal.getTransactionLsn(tx) catch {
                 self.stats.errors += 1;
                 return error.CorruptedWAL;
             };
@@ -259,7 +258,7 @@ pub const RecoveryEngine = struct {
                         self.stats.errors += 1;
                         return error.DuplicateTransactionId;
                     }
-                    var cloned = try self.cloneTransaction(&tx);
+                    var cloned = try self.cloneTransaction(tx);
                     {
                         errdefer cloned.deinit();
                         try self.seen_ids.put(tx.id, {});
@@ -272,7 +271,7 @@ pub const RecoveryEngine = struct {
                         self.stats.errors += 1;
                         return error.DuplicateTransactionId;
                     }
-                    var cloned = try self.cloneTransaction(&tx);
+                    var cloned = try self.cloneTransaction(tx);
                     {
                         errdefer cloned.deinit();
                         try self.seen_ids.put(tx.id, {});
@@ -310,9 +309,11 @@ pub const RecoveryEngine = struct {
     fn boundsCheck(self: *Self, offset: u64, size: u64) !void {
         const heap_size = self.heap.getSize();
         if (offset > heap_size) {
+            self.stats.errors += 1;
             return error.OutOfBounds;
         }
         if (size > heap_size - offset) {
+            self.stats.errors += 1;
             return error.OutOfBounds;
         }
     }
@@ -573,114 +574,98 @@ pub const RecoveryEngine = struct {
         return std.mem.alignForward(u64, current + 1, align_v);
     }
 
-    pub fn verifyHeapConsistency(self: *Self) !bool {
-        var consistent = true;
+    fn scanHeap(self: *Self, comptime repair: bool) !if (repair) usize else bool {
+        var result: if (repair) usize else bool = if (repair) 0 else true;
 
-        self.heap.header.validate() catch {
-            consistent = false;
-        };
+        if (repair) {
+            const heap_header_expected = self.heap.header.computeChecksum();
+            if (self.heap.header.checksum != heap_header_expected) {
+                const can_repair = self.heap.header.canRepair() catch false;
+                if (can_repair) {
+                    self.heap.header.checksum = 0;
+                    self.heap.header.updateChecksum();
+                    try self.heap.flushRange(0, @sizeOf(header.HeapHeader));
+                    result += 1;
+                } else {
+                    self.stats.errors += 1;
+                    return error.HeapCorruption;
+                }
+            }
+        } else {
+            self.heap.header.validate() catch {
+                result = false;
+            };
+        }
 
         const base_addr = self.heap.getBaseAddress();
         const alloc_metadata: *allocator_mod.AllocatorMetadata = @ptrCast(@alignCast(base_addr + header.HEADER_SIZE));
-        alloc_metadata.validate() catch {
-            consistent = false;
-        };
+
+        if (repair) {
+            const meta_expected = alloc_metadata.computeChecksum();
+            if (alloc_metadata.checksum != meta_expected) {
+                const can_repair = alloc_metadata.canRepair() catch false;
+                if (can_repair) {
+                    alloc_metadata.checksum = 0;
+                    alloc_metadata.updateChecksum();
+                    try self.heap.flushRange(header.HEADER_SIZE, @sizeOf(allocator_mod.AllocatorMetadata));
+                    result += 1;
+                } else {
+                    self.stats.errors += 1;
+                    return error.HeapCorruption;
+                }
+            }
+        } else {
+            alloc_metadata.validate() catch {
+                result = false;
+            };
+        }
 
         var offset: u64 = header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata);
         const heap_size = self.heap.getSize();
         while (offset + @sizeOf(header.ObjectHeader) <= heap_size) {
             const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + offset));
             if (!obj_header.hasValidMagic()) {
-                consistent = false;
+                if (!repair) result = false;
                 offset = nextScanOffset(offset);
                 continue;
             }
             const expected = obj_header.computeChecksum();
             if (obj_header.checksum != expected) {
-                consistent = false;
-                offset = nextScanOffset(offset);
-                continue;
+                if (repair) {
+                    obj_header.checksum = 0;
+                    obj_header.updateChecksum();
+                    try self.heap.flushRange(offset, @sizeOf(header.ObjectHeader));
+                    result += 1;
+                } else {
+                    result = false;
+                    offset = nextScanOffset(offset);
+                    continue;
+                }
             }
             const advance_result = @addWithOverflow(@as(u64, @sizeOf(header.ObjectHeader)), obj_header.size);
             if (advance_result[1] != 0) {
-                consistent = false;
+                if (!repair) result = false;
                 offset = nextScanOffset(offset);
                 continue;
             }
             const advance = advance_result[0];
             if (advance == 0 or offset + advance > heap_size) {
-                consistent = false;
+                if (!repair) result = false;
                 offset = nextScanOffset(offset);
                 continue;
             }
             offset += advance;
         }
 
-        return consistent;
+        return result;
+    }
+
+    pub fn verifyHeapConsistency(self: *Self) !bool {
+        return self.scanHeap(false);
     }
 
     pub fn repairHeap(self: *Self) !usize {
-        var repairs: usize = 0;
-
-        const heap_header_expected = self.heap.header.computeChecksum();
-        if (self.heap.header.checksum != heap_header_expected) {
-            const can_repair = self.heap.header.canRepair() catch false;
-            if (can_repair) {
-                self.heap.header.checksum = 0;
-                self.heap.header.updateChecksum();
-                try self.heap.flushRange(0, @sizeOf(header.HeapHeader));
-                repairs += 1;
-            } else {
-                self.stats.errors += 1;
-                return error.HeapCorruption;
-            }
-        }
-
-        const base_addr = self.heap.getBaseAddress();
-        const alloc_metadata: *allocator_mod.AllocatorMetadata = @ptrCast(@alignCast(base_addr + header.HEADER_SIZE));
-        const meta_expected = alloc_metadata.computeChecksum();
-        if (alloc_metadata.checksum != meta_expected) {
-            const can_repair = alloc_metadata.canRepair() catch false;
-            if (can_repair) {
-                alloc_metadata.checksum = 0;
-                alloc_metadata.updateChecksum();
-                try self.heap.flushRange(header.HEADER_SIZE, @sizeOf(allocator_mod.AllocatorMetadata));
-                repairs += 1;
-            } else {
-                self.stats.errors += 1;
-                return error.HeapCorruption;
-            }
-        }
-
-        var offset: u64 = header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata);
-        const heap_size = self.heap.getSize();
-        while (offset + @sizeOf(header.ObjectHeader) <= heap_size) {
-            const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + offset));
-            if (!obj_header.hasValidMagic()) {
-                offset = nextScanOffset(offset);
-                continue;
-            }
-            const expected = obj_header.computeChecksum();
-            if (obj_header.checksum != expected) {
-                obj_header.checksum = 0;
-                obj_header.updateChecksum();
-                try self.heap.flushRange(offset, @sizeOf(header.ObjectHeader));
-                repairs += 1;
-            }
-            const advance_result = @addWithOverflow(@as(u64, @sizeOf(header.ObjectHeader)), obj_header.size);
-            if (advance_result[1] != 0) {
-                offset = nextScanOffset(offset);
-                continue;
-            }
-            const advance = advance_result[0];
-            if (advance == 0 or offset + advance > heap_size) {
-                offset = nextScanOffset(offset);
-                continue;
-            }
-            offset += advance;
-        }
-
-        return repairs;
+        return self.scanHeap(true);
     }
 };
 
@@ -706,37 +691,29 @@ pub const CrashSimulator = struct {
     }
 
     pub fn addCrashPoint(self: *CrashSimulator, point: usize) !void {
-        var lo: usize = 0;
-        var hi: usize = self.crash_points.items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            const v = self.crash_points.items[mid];
-            if (v == point) {
-                return;
-            } else if (v < point) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
+        const lo = binarySearchInsertPos(self.crash_points.items, point) orelse return;
         try self.crash_points.insert(lo, point);
     }
 
-    fn binarySearch(items: []const usize, target: usize) bool {
+    fn binarySearchInsertPos(items: []const usize, target: usize) ?usize {
         var lo: usize = 0;
         var hi: usize = items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
             const v = items[mid];
             if (v == target) {
-                return true;
+                return null;
             } else if (v < target) {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        return false;
+        return lo;
+    }
+
+    fn binarySearch(items: []const usize, target: usize) bool {
+        return binarySearchInsertPos(items, target) == null;
     }
 
     pub fn shouldCrash(self: *CrashSimulator) bool {
@@ -761,17 +738,19 @@ pub const CrashSimulator = struct {
         return self.overflow_seen;
     }
 
-    pub fn reset(self: *CrashSimulator) void {
+    fn resetState(self: *CrashSimulator) void {
         self.current_step = 0;
         self.triggered = false;
         self.overflow_seen = false;
     }
 
+    pub fn reset(self: *CrashSimulator) void {
+        self.resetState();
+    }
+
     pub fn clear(self: *CrashSimulator) void {
         self.crash_points.clearRetainingCapacity();
-        self.current_step = 0;
-        self.triggered = false;
-        self.overflow_seen = false;
+        self.resetState();
     }
 };
 
