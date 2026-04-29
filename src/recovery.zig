@@ -1,3 +1,4 @@
+```zig
 const std = @import("std");
 const wal_mod = @import("wal.zig");
 const pheap = @import("pheap.zig");
@@ -20,8 +21,17 @@ pub const RecoveryStats = struct {
     records_redone: u64,
     records_undone: u64,
     errors: u64,
-    start_time: i64,
-    end_time: i64,
+    start_time_ns: i128,
+    end_time_ns: i128,
+
+    pub fn durationNs(self: *const RecoveryStats) i128 {
+        if (self.end_time_ns == 0 or self.end_time_ns < self.start_time_ns) return 0;
+        return self.end_time_ns - self.start_time_ns;
+    }
+
+    pub fn durationMs(self: *const RecoveryStats) i128 {
+        return @divTrunc(self.durationNs(), 1_000_000);
+    }
 };
 
 pub const RecoveryError = error{
@@ -32,7 +42,31 @@ pub const RecoveryError = error{
     CheckpointNotFound,
     UndoFailed,
     RedoFailed,
+    DuplicateTransactionId,
+    AlreadyRecovered,
+    OutOfBounds,
+    GenerationMismatch,
 };
+
+pub const CrashPhaseTag = enum {
+    analysis,
+    redo,
+    undo,
+    finalize,
+};
+
+pub const TransactionRecord = struct {
+    tx: wal_mod.Transaction,
+    lsn: u64,
+};
+
+fn ascendingLsn(_: void, a: TransactionRecord, b: TransactionRecord) bool {
+    return a.lsn < b.lsn;
+}
+
+fn descendingLsn(_: void, a: TransactionRecord, b: TransactionRecord) bool {
+    return a.lsn > b.lsn;
+}
 
 pub const RecoveryEngine = struct {
     heap: *pheap.PersistentHeap,
@@ -40,13 +74,15 @@ pub const RecoveryEngine = struct {
     phase: RecoveryPhase,
     stats: RecoveryStats,
     allocator: std.mem.Allocator,
-    incomplete_transactions: std.AutoHashMap(u64, wal_mod.Transaction),
-    committed_transactions: std.AutoHashMap(u64, wal_mod.Transaction),
-    last_checkpoint: u64,
+    incomplete_transactions: std.ArrayList(TransactionRecord),
+    committed_transactions: std.ArrayList(TransactionRecord),
+    seen_ids: std.AutoHashMap(u64, void),
+    last_checkpoint_lsn: u64,
+    crash_simulator: ?*CrashSimulator,
 
     const Self = @This();
 
-    pub fn init(heap: *pheap.PersistentHeap, wal: *wal_mod.WAL) RecoveryEngine {
+    pub fn init(heap: *pheap.PersistentHeap, wal: *wal_mod.WAL, allocator_param: std.mem.Allocator) RecoveryEngine {
         return RecoveryEngine{
             .heap = heap,
             .wal = wal,
@@ -58,69 +94,103 @@ pub const RecoveryEngine = struct {
                 .records_redone = 0,
                 .records_undone = 0,
                 .errors = 0,
-                .start_time = 0,
-                .end_time = 0,
+                .start_time_ns = 0,
+                .end_time_ns = 0,
             },
-            .allocator = heap.allocator,
-            .incomplete_transactions = std.AutoHashMap(u64, wal_mod.Transaction).init(heap.allocator),
-            .committed_transactions = std.AutoHashMap(u64, wal_mod.Transaction).init(heap.allocator),
-            .last_checkpoint = 0,
+            .allocator = allocator_param,
+            .incomplete_transactions = std.ArrayList(TransactionRecord).init(allocator_param),
+            .committed_transactions = std.ArrayList(TransactionRecord).init(allocator_param),
+            .seen_ids = std.AutoHashMap(u64, void).init(allocator_param),
+            .last_checkpoint_lsn = 0,
+            .crash_simulator = null,
         };
     }
 
+    pub fn setCrashSimulator(self: *Self, sim: *CrashSimulator) void {
+        self.crash_simulator = sim;
+    }
+
+    pub fn clearCrashSimulator(self: *Self) void {
+        self.crash_simulator = null;
+    }
+
     pub fn deinit(self: *Self) void {
-        {
-            var iter = self.incomplete_transactions.iterator();
-            while (iter.next()) |entry| {
-                const tx = entry.value_ptr;
-                tx.deinit();
-            }
-            self.incomplete_transactions.deinit();
+        for (self.incomplete_transactions.items) |*entry| {
+            entry.tx.deinit();
         }
-        {
-            var iter = self.committed_transactions.iterator();
-            while (iter.next()) |entry| {
-                const tx = entry.value_ptr;
-                tx.deinit();
+        self.incomplete_transactions.deinit();
+
+        for (self.committed_transactions.items) |*entry| {
+            entry.tx.deinit();
+        }
+        self.committed_transactions.deinit();
+
+        self.seen_ids.deinit();
+    }
+
+    fn maybeCrash(self: *Self, phase_tag: CrashPhaseTag) !void {
+        if (self.crash_simulator) |sim| {
+            if (sim.shouldCrash()) {
+                self.stats.errors += 1;
+                return switch (phase_tag) {
+                    .analysis => error.CorruptedWAL,
+                    .redo => error.RedoFailed,
+                    .undo => error.UndoFailed,
+                    .finalize => error.HeapCorruption,
+                };
             }
-            self.committed_transactions.deinit();
         }
     }
 
     pub fn recover(self: *Self) !void {
-        self.stats.start_time = std.time.timestamp();
+        if (self.phase != .none and self.phase != .failed) {
+            return error.AlreadyRecovered;
+        }
 
-        if (!self.needsRecovery()) {
+        self.stats.start_time_ns = std.time.nanoTimestamp();
+
+        errdefer {
+            self.phase = .failed;
+            self.stats.end_time_ns = std.time.nanoTimestamp();
+        }
+
+        if (!try self.needsRecoveryChecked()) {
             self.phase = .complete;
-            self.stats.end_time = std.time.timestamp();
+            self.stats.end_time_ns = std.time.nanoTimestamp();
             return;
         }
 
-        self.phase = .analysis;
-        errdefer self.phase = .failed;
+        self.last_checkpoint_lsn = self.wal.getLastCheckpointLsn();
 
+        self.phase = .analysis;
+        try self.maybeCrash(.analysis);
         try self.runAnalysisPhase();
+
+        std.mem.sort(TransactionRecord, self.committed_transactions.items, {}, ascendingLsn);
+        std.mem.sort(TransactionRecord, self.incomplete_transactions.items, {}, descendingLsn);
 
         self.phase = .redo;
         try self.runRedoPhase();
 
         self.phase = .undo;
-        errdefer self.phase = .failed;
-
         try self.runUndoPhase();
 
-        self.phase = .complete;
-        self.stats.end_time = std.time.timestamp();
-
+        try self.maybeCrash(.finalize);
         try self.finalizeRecovery();
+
+        self.phase = .complete;
+        self.stats.end_time_ns = std.time.nanoTimestamp();
     }
 
-    fn needsRecovery(self: *Self) bool {
+    fn needsRecoveryChecked(self: *Self) !bool {
         if (self.heap.header.isDirty()) {
             return true;
         }
 
-        const transactions = self.wal.getTransactions() catch return true;
+        const transactions = self.wal.getTransactions() catch {
+            self.stats.errors += 1;
+            return true;
+        };
         defer {
             for (transactions.items) |*tx| {
                 tx.deinit();
@@ -137,9 +207,33 @@ pub const RecoveryEngine = struct {
         return false;
     }
 
-    fn runAnalysisPhase(self: *Self) !void {
-        self.phase = .analysis;
+    fn cloneTransaction(self: *Self, src: *const wal_mod.Transaction) !wal_mod.Transaction {
+        var new_records = std.ArrayList(wal_mod.WALRecord).init(self.allocator);
+        errdefer {
+            if (comptime @hasDecl(wal_mod.WALRecord, "deinit")) {
+                for (new_records.items) |*r| {
+                    r.deinit(self.allocator);
+                }
+            }
+            new_records.deinit();
+        }
+        try new_records.ensureTotalCapacityPrecise(src.records.items.len);
+        for (src.records.items) |rec| {
+            const cloned = if (comptime @hasDecl(wal_mod.WALRecord, "clone"))
+                try rec.clone(self.allocator)
+            else
+                rec;
+            new_records.appendAssumeCapacity(cloned);
+        }
 
+        return wal_mod.Transaction{
+            .id = src.id,
+            .state = src.state,
+            .records = new_records,
+        };
+    }
+
+    fn runAnalysisPhase(self: *Self) !void {
         const transactions = try self.wal.getTransactions();
         defer {
             for (transactions.items) |*tx| {
@@ -149,25 +243,42 @@ pub const RecoveryEngine = struct {
         }
 
         for (transactions.items) |tx| {
+            const lsn = self.wal.getTransactionLsn(&tx) catch {
+                self.stats.errors += 1;
+                return error.CorruptedWAL;
+            };
+
+            if (lsn <= self.last_checkpoint_lsn and tx.state == .committed) {
+                continue;
+            }
+
             self.stats.transactions_analyzed += 1;
 
             switch (tx.state) {
                 .committed => {
-                    const tx_copy = wal_mod.Transaction{
-                        .id = tx.id,
-                        .state = tx.state,
-                        .records = try tx.records.clone(),
-                    };
-                    try self.committed_transactions.put(tx.id, tx_copy);
+                    if (self.seen_ids.contains(tx.id)) {
+                        self.stats.errors += 1;
+                        return error.DuplicateTransactionId;
+                    }
+                    var cloned = try self.cloneTransaction(&tx);
+                    {
+                        errdefer cloned.deinit();
+                        try self.seen_ids.put(tx.id, {});
+                        try self.committed_transactions.append(.{ .tx = cloned, .lsn = lsn });
+                    }
                     self.stats.transactions_committed += 1;
                 },
                 .active, .prepared => {
-                    const tx_copy = wal_mod.Transaction{
-                        .id = tx.id,
-                        .state = tx.state,
-                        .records = try tx.records.clone(),
-                    };
-                    try self.incomplete_transactions.put(tx.id, tx_copy);
+                    if (self.seen_ids.contains(tx.id)) {
+                        self.stats.errors += 1;
+                        return error.DuplicateTransactionId;
+                    }
+                    var cloned = try self.cloneTransaction(&tx);
+                    {
+                        errdefer cloned.deinit();
+                        try self.seen_ids.put(tx.id, {});
+                        try self.incomplete_transactions.append(.{ .tx = cloned, .lsn = lsn });
+                    }
                 },
                 .rolled_back => {},
             }
@@ -175,16 +286,13 @@ pub const RecoveryEngine = struct {
     }
 
     fn runRedoPhase(self: *Self) !void {
-        self.phase = .redo;
-
-        var iter = self.committed_transactions.iterator();
-        while (iter.next()) |entry| {
-            const tx = entry.value_ptr;
-            try self.redoTransaction(tx);
+        for (self.committed_transactions.items) |*entry| {
+            try self.redoTransaction(&entry.tx);
         }
     }
 
     fn redoTransaction(self: *Self, tx: *const wal_mod.Transaction) !void {
+        try self.maybeCrash(.redo);
         for (tx.records.items) |record| {
             switch (record.record_type) {
                 .allocate, .write, .free, .free_list_add, .free_list_remove, .heap_extend, .root_update => {
@@ -193,76 +301,121 @@ pub const RecoveryEngine = struct {
                 },
                 else => {
                     self.stats.errors += 1;
+                    return error.InvalidRecord;
                 },
             }
+        }
+        try self.maybeCrash(.redo);
+    }
+
+    fn boundsCheck(self: *Self, offset: u64, size: u64) !void {
+        const heap_size = self.heap.getSize();
+        if (offset > heap_size) {
+            return error.OutOfBounds;
+        }
+        if (size > heap_size - offset) {
+            return error.OutOfBounds;
+        }
+    }
+
+    fn freeWalData(self: *Self, data: []const u8) void {
+        if (comptime @hasDecl(wal_mod, "freeData")) {
+            wal_mod.freeData(self.allocator, data);
+        } else if (data.len > 0) {
+            self.allocator.free(data);
         }
     }
 
     fn redoRecord(self: *Self, record: *const wal_mod.WALRecord) !void {
         switch (record.record_type) {
             .allocate => {
+                try self.boundsCheck(record.offset, @sizeOf(header.ObjectHeader));
                 const base_addr = self.heap.getBaseAddress();
                 const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + record.offset));
                 obj_header.checksum = 0;
                 obj_header.setFreed(false);
                 obj_header.checksum = obj_header.computeChecksum();
                 try self.heap.flushRange(record.offset, @sizeOf(header.ObjectHeader));
+                try self.heap.markAllocated(record.offset, record.size);
             },
             .write => {
                 const new_data = try self.wal.getRedoData(record);
+                defer self.freeWalData(new_data);
                 if (new_data.len > 0) {
+                    try self.boundsCheck(record.offset, new_data.len);
+                    try self.verifyGeneration(record);
                     try self.heap.write(record.offset, new_data);
                 }
             },
             .free => {
+                try self.boundsCheck(record.offset, @sizeOf(header.ObjectHeader));
                 const base_addr = self.heap.getBaseAddress();
                 const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + record.offset));
                 obj_header.checksum = 0;
                 obj_header.setFreed(true);
                 obj_header.checksum = obj_header.computeChecksum();
                 try self.heap.flushRange(record.offset, @sizeOf(header.ObjectHeader));
+                try self.heap.markFreed(record.offset, record.size);
             },
             .heap_extend => {
                 if (record.size > 0) {
                     const current_size = self.heap.getSize();
-                    if (current_size < record.offset + record.size) {
-                        try self.heap.expand(record.size);
+                    const target_size = record.offset + record.size;
+                    if (current_size < target_size) {
+                        try self.heap.expand(target_size - current_size);
                     }
                 }
             },
             .root_update => {
                 const base_addr = self.heap.getBaseAddress();
                 const root_header: *header.HeapHeader = @ptrCast(@alignCast(base_addr));
-                root_header.checksum = 0;
                 root_header.root_offset = record.offset;
+                root_header.checksum = 0;
                 root_header.updateChecksum();
                 try self.heap.flushRange(0, @sizeOf(header.HeapHeader));
             },
             .free_list_add => {
-                try self.heap.allocator.free(self.heap.allocator.alloc(u8, record.size) catch return error.OutOfMemory);
+                try self.boundsCheck(record.offset, record.size);
+                try self.heap.freeListInsert(record.offset, record.size);
+                try self.heap.flushFreeListMetadata();
                 try self.heap.flushRange(record.offset, record.size);
             },
             .free_list_remove => {
+                try self.boundsCheck(record.offset, record.size);
+                try self.heap.freeListRemove(record.offset, record.size);
+                try self.heap.flushFreeListMetadata();
                 try self.heap.flushRange(record.offset, record.size);
             },
             else => {
                 self.stats.errors += 1;
+                return error.InvalidRecord;
             },
         }
     }
 
-    fn runUndoPhase(self: *Self) !void {
-        self.phase = .undo;
+    fn verifyGeneration(self: *Self, record: *const wal_mod.WALRecord) !void {
+        if (comptime !@hasField(wal_mod.WALRecord, "generation")) return;
+        if (comptime !@hasField(header.ObjectHeader, "generation")) return;
+        if (record.offset < @sizeOf(header.HeapHeader)) return;
+        const base_addr = self.heap.getBaseAddress();
+        const obj_offset = self.heap.findObjectHeaderOffset(record.offset) catch return;
+        const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + obj_offset));
+        const rec_gen = @field(record.*, "generation");
+        const obj_gen = @field(obj_header.*, "generation");
+        if (rec_gen != obj_gen) {
+            return error.GenerationMismatch;
+        }
+    }
 
-        var iter = self.incomplete_transactions.iterator();
-        while (iter.next()) |entry| {
-            const tx = entry.value_ptr;
-            try self.undoTransaction(tx);
+    fn runUndoPhase(self: *Self) !void {
+        for (self.incomplete_transactions.items) |*entry| {
+            try self.undoTransaction(&entry.tx);
             self.stats.transactions_rolled_back += 1;
         }
     }
 
     fn undoTransaction(self: *Self, tx: *const wal_mod.Transaction) !void {
+        try self.maybeCrash(.undo);
         var i: usize = tx.records.items.len;
         while (i > 0) {
             i -= 1;
@@ -281,14 +434,6 @@ pub const RecoveryEngine = struct {
                     try self.undoFree(&record);
                     self.stats.records_undone += 1;
                 },
-                .free_list_add => {
-                    try self.undoFreeListAdd(&record);
-                    self.stats.records_undone += 1;
-                },
-                .free_list_remove => {
-                    try self.undoFreeListRemove(&record);
-                    self.stats.records_undone += 1;
-                },
                 .heap_extend => {
                     try self.undoHeapExtend(&record);
                     self.stats.records_undone += 1;
@@ -297,81 +442,123 @@ pub const RecoveryEngine = struct {
                     try self.undoRootUpdate(&record);
                     self.stats.records_undone += 1;
                 },
-                else => {},
+                .free_list_add => {
+                    try self.undoFreeListAdd(&record);
+                    self.stats.records_undone += 1;
+                },
+                .free_list_remove => {
+                    try self.undoFreeListRemove(&record);
+                    self.stats.records_undone += 1;
+                },
+                else => {
+                    self.stats.errors += 1;
+                    return error.IncompleteTransaction;
+                },
             }
         }
+        try self.maybeCrash(.undo);
     }
 
     fn undoAllocate(self: *Self, record: *const wal_mod.WALRecord) !void {
+        try self.boundsCheck(record.offset, @sizeOf(header.ObjectHeader));
         const base_addr = self.heap.getBaseAddress();
         const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + record.offset));
         obj_header.checksum = 0;
         obj_header.setFreed(true);
         obj_header.checksum = obj_header.computeChecksum();
         try self.heap.flushRange(record.offset, @sizeOf(header.ObjectHeader));
-        try self.heap.allocator.free(self.heap.allocator.alloc(u8, record.size) catch return error.OutOfMemory);
+        if (!self.heap.isInFreeList(record.offset, record.size)) {
+            try self.heap.freeListInsert(record.offset, record.size);
+            try self.heap.flushFreeListMetadata();
+        }
+        try self.heap.markFreed(record.offset, record.size);
     }
 
     fn undoWrite(self: *Self, record: *const wal_mod.WALRecord) !void {
         const old_data = try self.wal.getUndoData(record);
+        defer self.freeWalData(old_data);
         if (old_data.len > 0) {
-            if (record.offset + old_data.len <= self.heap.getSize()) {
-                try self.heap.write(record.offset, old_data);
-            }
+            try self.boundsCheck(record.offset, old_data.len);
+            try self.verifyGeneration(record);
+            try self.heap.write(record.offset, old_data);
         }
     }
 
     fn undoFree(self: *Self, record: *const wal_mod.WALRecord) !void {
+        try self.boundsCheck(record.offset, @sizeOf(header.ObjectHeader));
         const base_addr = self.heap.getBaseAddress();
         const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + record.offset));
         obj_header.checksum = 0;
         obj_header.setFreed(false);
         obj_header.checksum = obj_header.computeChecksum();
         try self.heap.flushRange(record.offset, @sizeOf(header.ObjectHeader));
-        try self.heap.allocator.free(self.heap.allocator.alloc(u8, record.size) catch return error.OutOfMemory);
-    }
-
-    fn undoFreeListAdd(self: *Self, record: *const wal_mod.WALRecord) !void {
-        try self.heap.allocator.free(self.heap.allocator.alloc(u8, record.size) catch return error.OutOfMemory);
-        try self.heap.flushRange(record.offset, record.size);
-    }
-
-    fn undoFreeListRemove(self: *Self, record: *const wal_mod.WALRecord) !void {
-        try self.heap.allocator.free(self.heap.allocator.alloc(u8, record.size) catch return error.OutOfMemory);
-        try self.heap.flushRange(record.offset, record.size);
+        if (self.heap.isInFreeList(record.offset, record.size)) {
+            try self.heap.freeListRemove(record.offset, record.size);
+            try self.heap.flushFreeListMetadata();
+        }
+        try self.heap.markAllocated(record.offset, record.size);
     }
 
     fn undoHeapExtend(self: *Self, record: *const wal_mod.WALRecord) !void {
-        if (record.size > 0) {
-            const current_size = self.heap.getSize();
-            if (current_size > record.offset) {
-                try self.heap.shrink(record.offset);
-            }
+        const current_size = self.heap.getSize();
+        if (current_size > record.offset) {
+            try self.heap.shrink(record.offset);
         }
     }
 
     fn undoRootUpdate(self: *Self, record: *const wal_mod.WALRecord) !void {
+        const old_root = try self.wal.getUndoRootOffset(record);
         const base_addr = self.heap.getBaseAddress();
         const root_header: *header.HeapHeader = @ptrCast(@alignCast(base_addr));
+        root_header.root_offset = old_root;
         root_header.checksum = 0;
-        root_header.root_offset = record.offset;
         root_header.updateChecksum();
         try self.heap.flushRange(0, @sizeOf(header.HeapHeader));
     }
 
+    fn undoFreeListAdd(self: *Self, record: *const wal_mod.WALRecord) !void {
+        try self.boundsCheck(record.offset, record.size);
+        if (self.heap.isInFreeList(record.offset, record.size)) {
+            try self.heap.freeListRemove(record.offset, record.size);
+            try self.heap.flushFreeListMetadata();
+        }
+        try self.heap.flushRange(record.offset, record.size);
+    }
+
+    fn undoFreeListRemove(self: *Self, record: *const wal_mod.WALRecord) !void {
+        try self.boundsCheck(record.offset, record.size);
+        if (!self.heap.isInFreeList(record.offset, record.size)) {
+            try self.heap.freeListInsert(record.offset, record.size);
+            try self.heap.flushFreeListMetadata();
+        }
+        try self.heap.flushRange(record.offset, record.size);
+    }
+
     fn finalizeRecovery(self: *Self) !void {
+        var dirty_restored = false;
         errdefer {
-            self.heap.header.setDirty(true);
-            self.heap.header.updateChecksum();
-            self.heap.flushRange(0, @sizeOf(header.HeapHeader)) catch {};
+            if (!dirty_restored) {
+                self.heap.header.setDirty(true);
+                self.heap.header.checksum = 0;
+                self.heap.header.updateChecksum();
+                self.heap.flushRange(0, @sizeOf(header.HeapHeader)) catch |flush_err| {
+                    std.log.err("recovery: failed to restore dirty flag on flush: {s}", .{@errorName(flush_err)});
+                };
+                self.heap.sync() catch |sync_err| {
+                    std.log.err("recovery: failed to restore dirty flag on sync: {s}", .{@errorName(sync_err)});
+                };
+            }
         }
 
-        try self.wal.checkpoint();
         try self.heap.sync();
+        try self.wal.checkpoint();
 
         self.heap.header.setDirty(false);
+        self.heap.header.checksum = 0;
         self.heap.header.updateChecksum();
         try self.heap.flushRange(0, @sizeOf(header.HeapHeader));
+        try self.heap.sync();
+        dirty_restored = true;
     }
 
     pub fn getStats(self: *const Self) RecoveryStats {
@@ -382,60 +569,116 @@ pub const RecoveryEngine = struct {
         return self.phase;
     }
 
+    fn nextScanOffset(current: u64) u64 {
+        const align_v: u64 = @alignOf(header.ObjectHeader);
+        return std.mem.alignForward(u64, current + 1, align_v);
+    }
+
     pub fn verifyHeapConsistency(self: *Self) !bool {
-        try self.heap.header.validate();
+        var consistent = true;
+
+        self.heap.header.validate() catch {
+            consistent = false;
+        };
 
         const base_addr = self.heap.getBaseAddress();
         const alloc_metadata: *allocator_mod.AllocatorMetadata = @ptrCast(@alignCast(base_addr + header.HEADER_SIZE));
-        try alloc_metadata.validate();
+        alloc_metadata.validate() catch {
+            consistent = false;
+        };
 
-        var offset: usize = header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata);
-        while (offset < self.heap.getSize()) {
+        var offset: u64 = header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata);
+        const heap_size = self.heap.getSize();
+        while (offset + @sizeOf(header.ObjectHeader) <= heap_size) {
             const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + offset));
-            if (obj_header.magic != header.OBJECT_MAGIC) {
-                return false;
+            if (!obj_header.hasValidMagic()) {
+                consistent = false;
+                offset = nextScanOffset(offset);
+                continue;
             }
-            if (obj_header.checksum != obj_header.computeChecksum()) {
-                return false;
+            const expected = obj_header.computeChecksum();
+            if (obj_header.checksum != expected) {
+                consistent = false;
+                offset = nextScanOffset(offset);
+                continue;
             }
-            offset += @sizeOf(header.ObjectHeader) + obj_header.size;
+            const advance_result = @addWithOverflow(@as(u64, @sizeOf(header.ObjectHeader)), obj_header.size);
+            if (advance_result[1] != 0) {
+                consistent = false;
+                offset = nextScanOffset(offset);
+                continue;
+            }
+            const advance = advance_result[0];
+            if (advance == 0 or offset + advance > heap_size) {
+                consistent = false;
+                offset = nextScanOffset(offset);
+                continue;
+            }
+            offset += advance;
         }
 
-        return true;
+        return consistent;
     }
 
     pub fn repairHeap(self: *Self) !usize {
         var repairs: usize = 0;
 
-        const base_addr = self.heap.getBaseAddress();
-        const heap_header: *header.HeapHeader = @ptrCast(@alignCast(base_addr));
-
-        if (heap_header.checksum != heap_header.computeChecksum()) {
-            heap_header.checksum = 0;
-            heap_header.updateChecksum();
-            repairs += 1;
-        }
-
-        const alloc_metadata: *allocator_mod.AllocatorMetadata = @ptrCast(@alignCast(base_addr + header.HEADER_SIZE));
-
-        if (alloc_metadata.checksum != alloc_metadata.computeChecksum()) {
-            alloc_metadata.checksum = 0;
-            alloc_metadata.updateChecksum();
-            repairs += 1;
-        }
-
-        var offset: usize = header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata);
-        while (offset < self.heap.getSize()) {
-            const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + offset));
-            if (obj_header.magic != header.OBJECT_MAGIC) {
-                break;
+        const heap_header_expected = self.heap.header.computeChecksum();
+        if (self.heap.header.checksum != heap_header_expected) {
+            const can_repair = self.heap.header.canRepair() catch false;
+            if (can_repair) {
+                self.heap.header.checksum = 0;
+                self.heap.header.updateChecksum();
+                try self.heap.flushRange(0, @sizeOf(header.HeapHeader));
+                repairs += 1;
+            } else {
+                self.stats.errors += 1;
+                return error.HeapCorruption;
             }
-            if (obj_header.checksum != obj_header.computeChecksum()) {
+        }
+
+        const base_addr = self.heap.getBaseAddress();
+        const alloc_metadata: *allocator_mod.AllocatorMetadata = @ptrCast(@alignCast(base_addr + header.HEADER_SIZE));
+        const meta_expected = alloc_metadata.computeChecksum();
+        if (alloc_metadata.checksum != meta_expected) {
+            const can_repair = alloc_metadata.canRepair() catch false;
+            if (can_repair) {
+                alloc_metadata.checksum = 0;
+                alloc_metadata.updateChecksum();
+                try self.heap.flushRange(header.HEADER_SIZE, @sizeOf(allocator_mod.AllocatorMetadata));
+                repairs += 1;
+            } else {
+                self.stats.errors += 1;
+                return error.HeapCorruption;
+            }
+        }
+
+        var offset: u64 = header.HEADER_SIZE + @sizeOf(allocator_mod.AllocatorMetadata);
+        const heap_size = self.heap.getSize();
+        while (offset + @sizeOf(header.ObjectHeader) <= heap_size) {
+            const obj_header: *header.ObjectHeader = @ptrCast(@alignCast(base_addr + offset));
+            if (!obj_header.hasValidMagic()) {
+                offset = nextScanOffset(offset);
+                continue;
+            }
+            const expected = obj_header.computeChecksum();
+            if (obj_header.checksum != expected) {
                 obj_header.checksum = 0;
                 obj_header.updateChecksum();
+                try self.heap.flushRange(offset, @sizeOf(header.ObjectHeader));
                 repairs += 1;
             }
-            offset += @sizeOf(header.ObjectHeader) + obj_header.size;
+            const advance_result = @addWithOverflow(@as(u64, @sizeOf(header.ObjectHeader)), obj_header.size);
+            if (advance_result[1] != 0) {
+                offset = nextScanOffset(offset);
+                continue;
+            }
+            const advance = advance_result[0];
+            if (advance == 0 or offset + advance > heap_size) {
+                offset = nextScanOffset(offset);
+                continue;
+            }
+            offset += advance;
         }
 
         return repairs;
@@ -445,13 +688,17 @@ pub const RecoveryEngine = struct {
 pub const CrashSimulator = struct {
     allocator: std.mem.Allocator,
     crash_points: std.ArrayList(usize),
-    current_point: usize,
+    current_step: usize,
+    triggered: bool,
+    overflow_seen: bool,
 
-    pub fn init(allocator_ptr: std.mem.Allocator) CrashSimulator {
+    pub fn init(allocator_param: std.mem.Allocator) CrashSimulator {
         return CrashSimulator{
-            .allocator = allocator_ptr,
-            .crash_points = std.ArrayList(usize).init(allocator_ptr),
-            .current_point = 0,
+            .allocator = allocator_param,
+            .crash_points = std.ArrayList(usize).init(allocator_param),
+            .current_step = 0,
+            .triggered = false,
+            .overflow_seen = false,
         };
     }
 
@@ -460,38 +707,97 @@ pub const CrashSimulator = struct {
     }
 
     pub fn addCrashPoint(self: *CrashSimulator, point: usize) !void {
-        for (self.crash_points.items) |existing| {
-            if (existing == point) {
+        var lo: usize = 0;
+        var hi: usize = self.crash_points.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const v = self.crash_points.items[mid];
+            if (v == point) {
                 return;
+            } else if (v < point) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
-        try self.crash_points.append(point);
+        try self.crash_points.insert(lo, point);
+    }
+
+    fn binarySearch(items: []const usize, target: usize) bool {
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const v = items[mid];
+            if (v == target) {
+                return true;
+            } else if (v < target) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return false;
     }
 
     pub fn shouldCrash(self: *CrashSimulator) bool {
-        if (self.current_point >= self.crash_points.items.len) {
+        const add_result = @addWithOverflow(self.current_step, @as(usize, 1));
+        if (add_result[1] != 0) {
+            self.overflow_seen = true;
             return false;
         }
-        const point = self.crash_points.items[self.current_point];
-        self.current_point += 1;
-        return self.current_point == point;
+        self.current_step = add_result[0];
+        if (binarySearch(self.crash_points.items, self.current_step)) {
+            self.triggered = true;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn wasTriggered(self: *const CrashSimulator) bool {
+        return self.triggered;
+    }
+
+    pub fn hadOverflow(self: *const CrashSimulator) bool {
+        return self.overflow_seen;
     }
 
     pub fn reset(self: *CrashSimulator) void {
-        self.current_point = 0;
+        self.current_step = 0;
+        self.triggered = false;
+        self.overflow_seen = false;
+    }
+
+    pub fn clear(self: *CrashSimulator) void {
+        self.crash_points.clearRetainingCapacity();
+        self.current_step = 0;
+        self.triggered = false;
+        self.overflow_seen = false;
     }
 };
+
+fn assertNoLeak(status: std.heap.Check) void {
+    if (status != .ok) {
+        std.debug.panic("memory leak detected: {s}", .{@tagName(status)});
+    }
+}
 
 test "recovery engine initialization" {
     const testing = std.testing;
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    defer assertNoLeak(gpa.deinit());
     const alloc = gpa.allocator();
 
-    const test_heap_path = "/tmp/test_recovery.dat";
-    const test_wal_path = "/tmp/test_recovery.wal";
-    std.fs.cwd().deleteFile(test_heap_path) catch {};
-    std.fs.cwd().deleteFile(test_wal_path) catch {};
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp.dir.realpath(".", &path_buf);
+
+    const test_heap_path = try std.fs.path.join(alloc, &.{ tmp_path, "heap.dat" });
+    defer alloc.free(test_heap_path);
+    const test_wal_path = try std.fs.path.join(alloc, &.{ tmp_path, "wal.log" });
+    defer alloc.free(test_wal_path);
 
     var heap = try pheap.PersistentHeap.init(alloc, test_heap_path, 1024 * 1024, null);
     defer heap.deinit();
@@ -499,10 +805,98 @@ test "recovery engine initialization" {
     var wal = try wal_mod.WAL.init(alloc, test_wal_path, null);
     defer wal.deinit();
 
-    var recovery = RecoveryEngine.init(&heap, &wal);
+    var recovery = RecoveryEngine.init(&heap, &wal, alloc);
     defer recovery.deinit();
 
     try recovery.recover();
     try testing.expect(recovery.phase == .complete);
-    try testing.expect(recovery.stats.errors == 0);
+    try testing.expectEqual(@as(u64, 0), recovery.stats.errors);
+    try testing.expectEqual(@as(u64, 0), recovery.stats.transactions_analyzed);
+    try testing.expectEqual(@as(u64, 0), recovery.stats.transactions_committed);
+    try testing.expectEqual(@as(u64, 0), recovery.stats.transactions_rolled_back);
+    try testing.expectEqual(@as(u64, 0), recovery.stats.records_redone);
+    try testing.expectEqual(@as(u64, 0), recovery.stats.records_undone);
+
+    try testing.expectError(error.AlreadyRecovered, recovery.recover());
+}
+
+test "crash simulator semantics" {
+    const testing = std.testing;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer assertNoLeak(gpa.deinit());
+    const alloc = gpa.allocator();
+
+    var sim = CrashSimulator.init(alloc);
+    defer sim.deinit();
+
+    try sim.addCrashPoint(2);
+    try sim.addCrashPoint(2);
+    try sim.addCrashPoint(5);
+    try testing.expectEqual(@as(usize, 2), sim.crash_points.items.len);
+    try testing.expectEqual(@as(usize, 2), sim.crash_points.items[0]);
+    try testing.expectEqual(@as(usize, 5), sim.crash_points.items[1]);
+
+    try testing.expect(!sim.shouldCrash());
+    try testing.expect(sim.shouldCrash());
+    try testing.expect(!sim.shouldCrash());
+    try testing.expect(!sim.shouldCrash());
+    try testing.expect(sim.shouldCrash());
+    try testing.expect(sim.wasTriggered());
+
+    sim.reset();
+    try testing.expect(!sim.wasTriggered());
+    try testing.expectEqual(@as(usize, 0), sim.current_step);
+    try testing.expect(!sim.hadOverflow());
+}
+
+test "crash simulator binary search" {
+    const testing = std.testing;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer assertNoLeak(gpa.deinit());
+    const alloc = gpa.allocator();
+
+    var sim = CrashSimulator.init(alloc);
+    defer sim.deinit();
+
+    try sim.addCrashPoint(10);
+    try sim.addCrashPoint(3);
+    try sim.addCrashPoint(7);
+    try sim.addCrashPoint(1);
+    try sim.addCrashPoint(5);
+
+    try testing.expectEqual(@as(usize, 5), sim.crash_points.items.len);
+    try testing.expectEqual(@as(usize, 1), sim.crash_points.items[0]);
+    try testing.expectEqual(@as(usize, 3), sim.crash_points.items[1]);
+    try testing.expectEqual(@as(usize, 5), sim.crash_points.items[2]);
+    try testing.expectEqual(@as(usize, 7), sim.crash_points.items[3]);
+    try testing.expectEqual(@as(usize, 10), sim.crash_points.items[4]);
+}
+
+test "recovery stats duration safety" {
+    const testing = std.testing;
+    const stats = RecoveryStats{
+        .transactions_analyzed = 0,
+        .transactions_committed = 0,
+        .transactions_rolled_back = 0,
+        .records_redone = 0,
+        .records_undone = 0,
+        .errors = 0,
+        .start_time_ns = 1000,
+        .end_time_ns = 0,
+    };
+    try testing.expectEqual(@as(i128, 0), stats.durationNs());
+    try testing.expectEqual(@as(i128, 0), stats.durationMs());
+
+    const stats2 = RecoveryStats{
+        .transactions_analyzed = 0,
+        .transactions_committed = 0,
+        .transactions_rolled_back = 0,
+        .records_redone = 0,
+        .records_undone = 0,
+        .errors = 0,
+        .start_time_ns = 1000,
+        .end_time_ns = 5_000_000_000,
+    };
+    try testing.expectEqual(@as(i128, 4_999_999_000), stats2.durationNs());
+    try testing.expectEqual(@as(i128, 4999), stats2.durationMs());
 }
