@@ -1,4 +1,3 @@
-```zig
 const std = @import("std");
 const atomic = std.atomic;
 const header = @import("header.zig");
