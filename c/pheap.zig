@@ -8,6 +8,11 @@ const security = @import("security.zig");
 const os = std.os;
 const posix = std.posix;
 
+const ReadObjectResult = struct {
+    header: header.ObjectHeader,
+    data: []const u8,
+};
+
 pub const PersistentHeap = struct {
     base_addr: [*]align(std.mem.page_size) u8,
     size: u64,
@@ -169,7 +174,8 @@ pub const PersistentHeap = struct {
 
         const raw = try self.resolvePtr(ptr);
         if (raw) |r| {
-            return @ptrCast(@alignCast(r));
+            const typed: *T = @ptrCast(@alignCast(r));
+            return typed;
         }
         return null;
     }
@@ -251,7 +257,7 @@ pub const PersistentHeap = struct {
 
         const header_dest = try ptrAt(self.base_addr, offset);
         const header_bytes = std.mem.asBytes(obj_header);
-        @memcpy(header_dest[0..@sizeOf(header.ObjectHeader)], header_bytes[0..]);
+        @memcpy(header_dest[0..@sizeOf(header.ObjectHeader)], header_bytes);
 
         const data_offset = try checkedAddU64(offset, object_header_len);
         const data_dest = try ptrAt(self.base_addr, data_offset);
@@ -260,7 +266,7 @@ pub const PersistentHeap = struct {
         self.markDirty(offset, total_size);
     }
 
-    pub fn readObject(self: *const PersistentHeap, offset: u64) !?struct { header: header.ObjectHeader, data: []const u8 } {
+    pub fn readObject(self: *const PersistentHeap, offset: u64) !?ReadObjectResult {
         const object_header_len = objectHeaderSize();
 
         if (offset > self.size or object_header_len > self.size - offset) {
@@ -270,7 +276,7 @@ pub const PersistentHeap = struct {
         const header_src = try constPtrAt(self.base_addr, offset);
         var obj_header: header.ObjectHeader = undefined;
         const header_bytes = std.mem.asBytes(&obj_header);
-        @memcpy(header_bytes[0..], header_src[0..@sizeOf(header.ObjectHeader)]);
+        @memcpy(header_bytes, header_src[0..@sizeOf(header.ObjectHeader)]);
 
         try obj_header.validate();
 
@@ -568,24 +574,11 @@ const OpenResult = struct {
 };
 
 fn openOrCreateFile(path: []const u8, size: u64) !OpenResult {
-    if (std.fs.cwd().openFile(path, .{ .mode = .read_write })) |existing| {
-        errdefer existing.close();
+    const cwd = std.fs.cwd();
 
-        const stat = try existing.stat();
-        const target_size = try alignToPageSize(@max(stat.size, size));
-
-        if (stat.size != target_size) {
-            try existing.setEndPos(target_size);
-        }
-
-        return .{
-            .file = existing,
-            .created = stat.size == 0,
-            .map_size = target_size,
-        };
-    } else |err| switch (err) {
+    const existing = cwd.openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
         error.FileNotFound => {
-            const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = false });
+            const file = try cwd.createFile(path, .{ .read = true, .truncate = false });
             errdefer file.close();
 
             const target_size = try normalizeHeapSize(size);
@@ -598,7 +591,22 @@ fn openOrCreateFile(path: []const u8, size: u64) !OpenResult {
             };
         },
         else => return err,
+    };
+
+    errdefer existing.close();
+
+    const stat = try existing.stat();
+    const target_size = try alignToPageSize(@max(stat.size, size));
+
+    if (stat.size != target_size) {
+        try existing.setEndPos(target_size);
     }
+
+    return .{
+        .file = existing,
+        .created = stat.size == 0,
+        .map_size = target_size,
+    };
 }
 
 fn mapFile(fd: posix.fd_t, size: u64) ![*]align(std.mem.page_size) u8 {
@@ -616,7 +624,7 @@ fn mapFile(fd: posix.fd_t, size: u64) ![*]align(std.mem.page_size) u8 {
         fd,
         0,
     );
-    return ptr.ptr;
+    return ptr;
 }
 
 fn unmapFile(base_addr: [*]align(std.mem.page_size) u8, size: u64) void {
