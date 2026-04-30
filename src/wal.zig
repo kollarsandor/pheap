@@ -9,6 +9,9 @@ pub const WAL_VERSION: u32 = 1;
 pub const WAL_BLOCK_SIZE: u64 = 4096;
 pub const MAX_RECORDS_PER_TRANSACTION: usize = 1024;
 
+const INITIAL_WAL_SIZE: u64 = 1024 * 1024 * 64;
+const RECORD_FLAG_HAS_UNDO: u8 = 1;
+
 pub const RecordType = enum(u8) {
     begin = 1,
     commit = 2,
@@ -38,52 +41,57 @@ pub const WALHeader = extern struct {
     checksum: u32,
     reserved: [28]u8,
 
-    pub fn init() WALHeader {
+    pub fn init(file_size: u64) WALHeader {
         return WALHeader{
             .magic = WAL_MAGIC,
             .version = WAL_VERSION,
-            .file_size = @sizeOf(WALHeader),
+            .file_size = file_size,
             .last_checkpoint = 0,
             .transaction_counter = 0,
-            .head_offset = @sizeOf(WALHeader),
-            .tail_offset = @sizeOf(WALHeader),
+            .head_offset = headerSize(),
+            .tail_offset = headerSize(),
             .checksum = 0,
             .reserved = [_]u8{0} ** 28,
         };
     }
 
-    pub fn validate(self: *const WALHeader) !void {
+    pub fn validate(self: *const WALHeader, actual_file_size: u64) !void {
         if (self.magic != WAL_MAGIC) return error.InvalidWALMagic;
-        if (self.version > WAL_VERSION) return error.UnsupportedWALVersion;
+        if (self.version != WAL_VERSION) return error.UnsupportedWALVersion;
+        if (self.file_size != actual_file_size) return error.InvalidWALFileSize;
+        if (self.file_size < headerSize()) return error.InvalidWALFileSize;
+        if (self.head_offset < headerSize()) return error.InvalidWALHeadOffset;
+        if (self.tail_offset < headerSize()) return error.InvalidWALTailOffset;
+        if (self.head_offset > self.tail_offset) return error.InvalidWALHeadOffset;
+        if (self.tail_offset > self.file_size) return error.InvalidWALTailOffset;
+        if (self.last_checkpoint > self.tail_offset) return error.InvalidWALCheckpoint;
+        if ((self.head_offset - headerSize()) % recordAlignment() != 0) return error.InvalidWALHeadOffset;
+        if (self.computeChecksum() != self.checksum) return error.HeaderChecksumMismatch;
     }
 
     pub fn computeChecksum(self: *const WALHeader) u32 {
         const bytes = std.mem.asBytes(self);
+        const checksum_offset = @offsetOf(WALHeader, "checksum");
         var crc: u32 = 0xFFFFFFFF;
-        for (bytes[0..@offsetOf(WALHeader, "checksum")]) |byte| {
+        for (bytes[0..checksum_offset]) |byte| {
+            crc = crc32cByte(crc, byte);
+        }
+        for (bytes[checksum_offset + @sizeOf(u32) ..]) |byte| {
             crc = crc32cByte(crc, byte);
         }
         return crc ^ 0xFFFFFFFF;
     }
 
     pub fn updateChecksum(self: *WALHeader) void {
+        self.checksum = 0;
         self.checksum = self.computeChecksum();
-    }
-
-    fn crc32cByte(crc: u32, byte: u8) u32 {
-        const POLY: u32 = 0x82F63B78;
-        var c = crc ^ @as(u32, byte);
-        var j: usize = 0;
-        while (j < 8) : (j += 1) {
-            c = if ((c & 1) != 0) (c >> 1) ^ POLY else c >> 1;
-        }
-        return c;
     }
 };
 
 pub const WALRecord = extern struct {
-    record_type: RecordType,
+    record_type: u8,
     flags: u8,
+    padding: [6]u8,
     transaction_id: u64,
     sequence: u64,
     offset: u64,
@@ -101,8 +109,9 @@ pub const WALRecord = extern struct {
         size: u64,
     ) WALRecord {
         return WALRecord{
-            .record_type = record_type,
+            .record_type = @intFromEnum(record_type),
             .flags = 0,
+            .padding = [_]u8{0} ** 6,
             .transaction_id = tx_id,
             .sequence = seq,
             .offset = offset,
@@ -114,33 +123,53 @@ pub const WALRecord = extern struct {
         };
     }
 
+    pub fn getType(self: *const WALRecord) !RecordType {
+        return std.meta.intToEnum(RecordType, self.record_type) catch error.InvalidRecordType;
+    }
+
+    pub fn hasUndoData(self: *const WALRecord) bool {
+        return (self.flags & RECORD_FLAG_HAS_UNDO) != 0;
+    }
+
+    pub fn setUndoData(self: *WALRecord, old_value_offset: u64, data: []const u8) void {
+        self.flags |= RECORD_FLAG_HAS_UNDO;
+        self.old_value_offset = old_value_offset;
+        self.old_value_size = @as(u64, @intCast(data.len));
+        self.data_checksum = computeDataChecksum(data);
+    }
+
+    pub fn clearUndoData(self: *WALRecord) void {
+        self.flags &= ~@as(u8, RECORD_FLAG_HAS_UNDO);
+        self.old_value_offset = 0;
+        self.old_value_size = 0;
+        self.data_checksum = 0;
+    }
+
     pub fn computeChecksum(self: *const WALRecord) u32 {
         const bytes = std.mem.asBytes(self);
+        const checksum_offset = @offsetOf(WALRecord, "record_checksum");
         var crc: u32 = 0xFFFFFFFF;
-        for (bytes[0..@offsetOf(WALRecord, "record_checksum")]) |byte| {
+        for (bytes[0..checksum_offset]) |byte| {
             crc = crc32cByte(crc, byte);
         }
         return crc ^ 0xFFFFFFFF;
     }
 
     pub fn updateChecksum(self: *WALRecord) void {
+        self.record_checksum = 0;
         self.record_checksum = self.computeChecksum();
     }
 
     pub fn validate(self: *const WALRecord) !void {
-        if (self.computeChecksum() != self.record_checksum) {
-            return error.RecordChecksumMismatch;
+        _ = try self.getType();
+        if ((self.flags & ~@as(u8, RECORD_FLAG_HAS_UNDO)) != 0) return error.InvalidRecordFlags;
+        if (!std.mem.eql(u8, self.padding[0..], &[_]u8{ 0, 0, 0, 0, 0, 0 })) return error.InvalidRecordPadding;
+        if (!self.hasUndoData()) {
+            if (self.old_value_offset != 0) return error.InvalidUndoOffset;
+            if (self.old_value_size != 0) return error.InvalidUndoSize;
+            if (self.data_checksum != 0) return error.DataChecksumMismatch;
         }
-    }
-
-    fn crc32cByte(crc: u32, byte: u8) u32 {
-        const POLY: u32 = 0x82F63B78;
-        var c = crc ^ @as(u32, byte);
-        var j: usize = 0;
-        while (j < 8) : (j += 1) {
-            c = if ((c & 1) != 0) (c >> 1) ^ POLY else c >> 1;
-        }
-        return c;
+        if (self.computeChecksum() != self.record_checksum) return error.RecordChecksumMismatch;
     }
 };
 
@@ -151,6 +180,7 @@ pub const Transaction = struct {
     undo_data: std.ArrayList([]u8),
     start_offset: u64,
     allocator: std.mem.Allocator,
+    deinitialized: bool,
 
     pub const State = enum(u8) {
         active,
@@ -167,27 +197,49 @@ pub const Transaction = struct {
             .undo_data = std.ArrayList([]u8).init(allocator_ptr),
             .start_offset = 0,
             .allocator = allocator_ptr,
+            .deinitialized = false,
         };
     }
 
     pub fn deinit(self: *Transaction) void {
+        if (self.deinitialized) return;
         for (self.undo_data.items) |data| {
             self.allocator.free(data);
         }
         self.undo_data.deinit();
         self.records.deinit();
+        self.deinitialized = true;
     }
 
     pub fn addRecord(self: *Transaction, record: WALRecord) !void {
+        if (self.deinitialized) return error.TransactionDeinitialized;
+        if (self.records.items.len >= MAX_RECORDS_PER_TRANSACTION) return error.TooManyRecords;
         try self.records.append(record);
     }
 
     pub fn addUndoData(self: *Transaction, data: []const u8) !void {
+        if (self.deinitialized) return error.TransactionDeinitialized;
         const copy = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(copy);
         try self.undo_data.append(copy);
     }
 
+    pub fn addRecordWithUndoData(self: *Transaction, record: WALRecord, data: []const u8) !void {
+        if (self.deinitialized) return error.TransactionDeinitialized;
+        if (self.records.items.len >= MAX_RECORDS_PER_TRANSACTION) return error.TooManyRecords;
+        const copy = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(copy);
+        try self.undo_data.append(copy);
+        errdefer {
+            const idx = self.undo_data.items.len - 1;
+            self.allocator.free(self.undo_data.items[idx]);
+            _ = self.undo_data.pop();
+        }
+        try self.records.append(record);
+    }
+
     pub fn getRecordCount(self: *const Transaction) usize {
+        if (self.deinitialized) return 0;
         return self.records.items.len;
     }
 };
@@ -196,9 +248,8 @@ pub const WAL = struct {
     file: std.fs.File,
     file_path: []const u8,
     header: *WALHeader,
-    base_addr: [*]align(std.mem.page_size) u8,
+    mapping: []align(std.mem.page_size) u8,
     mapped_size: u64,
-    current_transaction: ?Transaction,
     security: ?*security.SecurityManager,
     allocator: std.mem.Allocator,
     lock: std.Thread.Mutex,
@@ -215,71 +266,61 @@ pub const WAL = struct {
         errdefer allocator_ptr.destroy(self);
 
         const path_copy = try allocator_ptr.dupe(u8, file_path);
+        errdefer allocator_ptr.free(path_copy);
 
-        const file = std.fs.cwd().createFile(
-            file_path,
-            .{ .read = true, .truncate = false, .exclusive = false },
-        ) catch |err| blk: {
-            if (err == error.PathAlreadyExists) {
-                break :blk try std.fs.cwd().openFile(file_path, .{ .mode = .read_write });
-            } else {
-                return err;
-            }
+        const file = std.fs.cwd().openFile(file_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => try std.fs.cwd().createFile(file_path, .{ .read = true, .truncate = false, .exclusive = false }),
+            else => return err,
         };
         errdefer file.close();
 
         const stat = try file.stat();
-        const initial_size: u64 = 1024 * 1024 * 64;
-        const file_size = if (stat.size == 0) initial_size else stat.size;
+        const file_size: u64 = if (stat.size == 0) INITIAL_WAL_SIZE else stat.size;
+        if (file_size < headerSize()) return error.InvalidWALFileSize;
 
         if (stat.size == 0) {
             try file.setEndPos(file_size);
         }
 
-        const base_addr = try posix.mmap(
+        const map_len = try toUsize(file_size);
+        const mapping = try posix.mmap(
             null,
-            file_size,
+            map_len,
             posix.PROT.READ | posix.PROT.WRITE,
             .{ .TYPE = .SHARED },
             file.handle,
             0,
         );
-        errdefer posix.munmap(base_addr);
+        errdefer posix.munmap(mapping);
 
-        const header_ptr: *WALHeader = @ptrCast(@alignCast(base_addr.ptr));
-
-        if (stat.size == 0) {
-            header_ptr.* = WALHeader.init();
-            header_ptr.file_size = file_size;
-            header_ptr.updateChecksum();
-        } else {
-            try header_ptr.validate();
-        }
+        const header_ptr: *WALHeader = @ptrCast(@alignCast(mapping.ptr));
 
         self.* = WAL{
             .file = file,
             .file_path = path_copy,
             .header = header_ptr,
-            .base_addr = @ptrCast(@alignCast(base_addr.ptr)),
+            .mapping = mapping,
             .mapped_size = file_size,
-            .current_transaction = null,
             .security = security_mgr,
             .allocator = allocator_ptr,
             .lock = std.Thread.Mutex{},
             .sequence_counter = 0,
         };
 
+        if (stat.size == 0) {
+            self.header.* = WALHeader.init(file_size);
+            try self.flushHeader();
+        } else {
+            try self.header.validate(file_size);
+            self.sequence_counter = try self.recoverSequenceCounter();
+        }
+
         return self;
     }
 
     pub fn deinit(self: *WAL) void {
         self.flush() catch {};
-
-        if (self.current_transaction) |*tx| {
-            tx.deinit();
-        }
-
-        posix.munmap(self.base_addr[0..self.mapped_size]);
+        posix.munmap(self.mapping);
         self.file.close();
         self.allocator.free(self.file_path);
         self.allocator.destroy(self);
@@ -289,33 +330,28 @@ pub const WAL = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        self.header.transaction_counter += 1;
-        self.header.updateChecksum();
+        const next_id = try checkedAdd(self.header.transaction_counter, 1);
+        var tx = Transaction.init(self.allocator, next_id);
+        errdefer tx.deinit();
 
-        var tx = Transaction.init(self.allocator, self.header.transaction_counter);
         tx.start_offset = self.header.tail_offset;
-
-        const begin_record = WALRecord.init(.begin, tx.id, self.getNextSequence(), 0, 0);
+        var begin_record = WALRecord.init(.begin, tx.id, self.getNextSequenceLocked(), 0, 0);
+        begin_record.updateChecksum();
         try tx.addRecord(begin_record);
+
+        self.header.transaction_counter = next_id;
+        try self.flushHeader();
 
         return tx;
     }
 
     pub fn endTransaction(self: *Self, tx: *Transaction) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
-
-        if (tx.state == .active) {
-            tx.state = .rolled_back;
+        if (!tx.deinitialized and tx.state == .active) {
+            self.rollbackTransaction(tx) catch |err| {
+                tx.deinit();
+                return err;
+            };
         }
-
-        if (self.current_transaction) |*current| {
-            if (current.id == tx.id) {
-                current.deinit();
-                self.current_transaction = null;
-            }
-        }
-
         tx.deinit();
     }
 
@@ -323,7 +359,12 @@ pub const WAL = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        const record = WALRecord.init(record_type, tx.id, self.getNextSequence(), offset, size);
+        if (tx.deinitialized) return error.TransactionDeinitialized;
+        if (tx.state != .active) return error.TransactionNotActive;
+        _ = try checkedAdd(offset, size);
+
+        var record = WALRecord.init(record_type, tx.id, self.getNextSequenceLocked(), offset, size);
+        record.updateChecksum();
         try tx.addRecord(record);
     }
 
@@ -331,27 +372,35 @@ pub const WAL = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        var record = WALRecord.init(record_type, tx.id, self.getNextSequence(), offset, size);
-        record.old_value_offset = self.header.tail_offset + @sizeOf(WALRecord);
-        record.old_value_size = old_data.len;
+        if (tx.deinitialized) return error.TransactionDeinitialized;
+        if (tx.state != .active) return error.TransactionNotActive;
+        _ = try checkedAdd(offset, size);
+        if (old_data.len == 0) return error.EmptyUndoData;
+        if (old_data.len != size) return error.UndoSizeMismatch;
+
+        var record = WALRecord.init(record_type, tx.id, self.getNextSequenceLocked(), offset, size);
+        record.flags |= RECORD_FLAG_HAS_UNDO;
+        record.old_value_size = @as(u64, @intCast(old_data.len));
         record.data_checksum = computeDataChecksum(old_data);
         record.updateChecksum();
 
-        try tx.addRecord(record);
-        try tx.addUndoData(old_data);
+        try tx.addRecordWithUndoData(record, old_data);
     }
 
     pub fn commitTransaction(self: *Self, tx: *Transaction) !void {
         self.lock.lock();
         defer self.lock.unlock();
 
-        const commit_record = WALRecord.init(.commit, tx.id, self.getNextSequence(), 0, 0);
+        if (tx.deinitialized) return error.TransactionDeinitialized;
+        if (tx.state != .active and tx.state != .prepared) return error.TransactionNotActive;
+
+        var commit_record = WALRecord.init(.commit, tx.id, self.getNextSequenceLocked(), 0, 0);
+        commit_record.updateChecksum();
         try tx.addRecord(commit_record);
+        errdefer _ = tx.records.pop();
 
-        try self.writeTransactionRecords(tx);
-
+        try self.writeTransactionRecordsLocked(tx);
         tx.state = .committed;
-
         try self.sync();
     }
 
@@ -359,49 +408,94 @@ pub const WAL = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        const rollback_record = WALRecord.init(.rollback, tx.id, self.getNextSequence(), 0, 0);
+        if (tx.deinitialized) return error.TransactionDeinitialized;
+        if (tx.state == .committed) return error.TransactionAlreadyCommitted;
+        if (tx.state == .rolled_back) return;
+
+        var rollback_record = WALRecord.init(.rollback, tx.id, self.getNextSequenceLocked(), 0, 0);
+        rollback_record.updateChecksum();
         try tx.addRecord(rollback_record);
+        errdefer _ = tx.records.pop();
 
-        try self.writeTransactionRecords(tx);
-
+        try self.writeTransactionRecordsLocked(tx);
         tx.state = .rolled_back;
+        try self.sync();
     }
 
-    fn writeTransactionRecords(self: *Self, tx: *Transaction) !void {
-        var offset = self.header.tail_offset;
+    fn writeTransactionRecordsLocked(self: *Self, tx: *Transaction) !void {
+        if (tx.records.items.len == 0) return error.EmptyTransaction;
 
-        for (tx.records.items) |*record| {
+        const start_offset = self.header.tail_offset;
+        var total_size: u64 = 0;
+        var undo_count: usize = 0;
+
+        for (tx.records.items) |record| {
+            try record.validateWithoutChecksumForPending();
+            total_size = try checkedAdd(total_size, recordSize());
+            if (record.hasUndoData()) {
+                if (undo_count >= tx.undo_data.items.len) return error.UndoDataCountMismatch;
+                total_size = try checkedAdd(total_size, @as(u64, @intCast(tx.undo_data.items[undo_count].len)));
+                undo_count += 1;
+            }
+        }
+
+        if (undo_count != tx.undo_data.items.len) return error.UndoDataCountMismatch;
+
+        const buffer_len = try toUsize(total_size);
+        var buffer = try self.allocator.alloc(u8, buffer_len);
+        defer self.allocator.free(buffer);
+        @memset(buffer, 0);
+
+        var rel: usize = 0;
+        var undo_index: usize = 0;
+
+        for (tx.records.items, 0..) |*record_slot, idx| {
+            var record = record_slot.*;
+            const record_start = try checkedAdd(start_offset, @as(u64, @intCast(rel)));
+
+            if (record.hasUndoData()) {
+                const data = tx.undo_data.items[undo_index];
+                const data_offset = try checkedAdd(record_start, recordSize());
+                record.setUndoData(data_offset, data);
+                undo_index += 1;
+            } else {
+                record.clearUndoData();
+            }
+
+            try validateRecordSemantics(&record, idx == 0);
             record.updateChecksum();
 
-            if (offset + @sizeOf(WALRecord) > self.mapped_size) {
-                try self.expandFile();
+            const rec_len = try toUsize(recordSize());
+            @memcpy(buffer[rel .. rel + rec_len], std.mem.asBytes(&record));
+            rel += rec_len;
+
+            if (record.hasUndoData()) {
+                const data = tx.undo_data.items[undo_index - 1];
+                @memcpy(buffer[rel .. rel + data.len], data);
+                rel += data.len;
             }
 
-            const record_ptr: *WALRecord = @ptrCast(@alignCast(self.base_addr + offset));
-            record_ptr.* = record.*;
-            offset += @sizeOf(WALRecord);
-
-            self.header.tail_offset = offset;
+            record_slot.* = record;
         }
 
-        var undo_idx: usize = 0;
-        for (tx.undo_data.items) |data| {
-            if (offset + data.len > self.mapped_size) {
-                try self.expandFile();
-            }
+        if (rel != buffer.len) return error.InternalWALEncodingError;
 
-            @memcpy(self.base_addr[offset .. offset + data.len], data);
-            offset += data.len;
-            undo_idx += 1;
-        }
+        const end_offset = try checkedAdd(start_offset, total_size);
+        try self.ensureMappedCapacity(end_offset);
+        try self.writeAt(start_offset, buffer);
 
-        self.header.tail_offset = offset;
-        self.header.updateChecksum();
-
+        self.header.tail_offset = end_offset;
+        self.header.file_size = self.mapped_size;
         try self.flushHeader();
     }
 
     pub fn getRecords(self: *Self, start_offset: u64, max_records: usize) !std.ArrayList(WALRecord) {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        if (start_offset < headerSize()) return error.InvalidStartOffset;
+        if (start_offset > self.header.tail_offset) return error.InvalidStartOffset;
+
         var records = std.ArrayList(WALRecord).init(self.allocator);
         errdefer records.deinit();
 
@@ -409,12 +503,9 @@ pub const WAL = struct {
         var count: usize = 0;
 
         while (offset < self.header.tail_offset and count < max_records) {
-            const record_ptr: *const WALRecord = @ptrCast(@alignCast(self.base_addr + offset));
-
-            record_ptr.validate() catch break;
-
-            try records.append(record_ptr.*);
-            offset += @sizeOf(WALRecord);
+            const parsed = try self.readRecordAtLocked(offset);
+            try records.append(parsed.record);
+                        offset = parsed.next_offset;
             count += 1;
         }
 
@@ -422,50 +513,80 @@ pub const WAL = struct {
     }
 
     pub fn getTransactions(self: *Self) !std.ArrayList(Transaction) {
-        var transactions = std.ArrayList(Transaction).init(self.allocator);
-        errdefer transactions.deinit();
+        self.lock.lock();
+        defer self.lock.unlock();
 
-        var offset: u64 = @sizeOf(WALHeader);
+        var transactions = std.ArrayList(Transaction).init(self.allocator);
+        errdefer {
+            for (transactions.items) |*tx| {
+                tx.deinit();
+            }
+            transactions.deinit();
+        }
+
+        var offset = self.header.head_offset;
         var current_tx: ?Transaction = null;
+        errdefer {
+            if (current_tx) |*tx| {
+                tx.deinit();
+            }
+        }
 
         while (offset < self.header.tail_offset) {
-            const record_ptr: *const WALRecord = @ptrCast(@alignCast(self.base_addr + offset));
-            record_ptr.validate() catch break;
+            const parsed = try self.readRecordAtLocked(offset);
+            const record_type = try parsed.record.getType();
 
-            switch (record_ptr.record_type) {
+            switch (record_type) {
                 .begin => {
-                    if (current_tx) |*tx| {
-                        try transactions.append(tx.*);
-                    }
-                    current_tx = Transaction.init(self.allocator, record_ptr.transaction_id);
+                    if (current_tx != null) return error.NestedTransaction;
+                    current_tx = Transaction.init(self.allocator, parsed.record.transaction_id);
                     current_tx.?.start_offset = offset;
+                    try current_tx.?.addRecord(parsed.record);
                 },
                 .commit => {
                     if (current_tx) |*tx| {
+                        if (tx.id != parsed.record.transaction_id) return error.TransactionIdMismatch;
+                        try tx.addRecord(parsed.record);
                         tx.state = .committed;
                         try transactions.append(tx.*);
                         current_tx = null;
+                    } else {
+                        return error.CommitWithoutBegin;
                     }
                 },
                 .rollback => {
                     if (current_tx) |*tx| {
+                        if (tx.id != parsed.record.transaction_id) return error.TransactionIdMismatch;
+                        try tx.addRecord(parsed.record);
                         tx.state = .rolled_back;
                         try transactions.append(tx.*);
                         current_tx = null;
+                    } else {
+                        return error.RollbackWithoutBegin;
                     }
                 },
+                .checkpoint => {},
                 else => {
                     if (current_tx) |*tx| {
-                        try tx.addRecord(record_ptr.*);
+                        if (tx.id != parsed.record.transaction_id) return error.TransactionIdMismatch;
+                        try tx.addRecord(parsed.record);
+                        if (parsed.record.hasUndoData()) {
+                            const undo_data = try self.getUndoDataLocked(&parsed.record);
+                            try tx.addUndoData(undo_data);
+                        }
+                    } else {
+                        return error.RecordWithoutBegin;
                     }
                 },
             }
 
-            offset += @sizeOf(WALRecord);
+            offset = parsed.next_offset;
         }
 
         if (current_tx) |*tx| {
+            tx.state = .active;
             try transactions.append(tx.*);
+            current_tx = null;
         }
 
         return transactions;
@@ -475,19 +596,19 @@ pub const WAL = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        const checkpoint_record = WALRecord.init(.checkpoint, 0, self.getNextSequence(), self.header.tail_offset, 0);
-        var record = checkpoint_record;
+        const offset = self.header.tail_offset;
+        const end_offset = try checkedAdd(offset, recordSize());
+        try self.ensureMappedCapacity(end_offset);
+
+        var record = WALRecord.init(.checkpoint, 0, self.getNextSequenceLocked(), offset, 0);
         record.updateChecksum();
 
-        const offset = self.header.tail_offset;
-        const record_ptr: *WALRecord = @ptrCast(@alignCast(self.base_addr + offset));
-        record_ptr.* = record;
+        try self.writeAt(offset, std.mem.asBytes(&record));
 
-        self.header.tail_offset = offset + @sizeOf(WALRecord);
-        self.header.head_offset = self.header.tail_offset;
-        self.header.last_checkpoint = self.header.tail_offset;
-        self.header.updateChecksum();
-
+        self.header.tail_offset = end_offset;
+        self.header.head_offset = end_offset;
+        self.header.last_checkpoint = offset;
+        self.header.file_size = self.mapped_size;
         try self.flushHeader();
         try self.sync();
     }
@@ -496,94 +617,267 @@ pub const WAL = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        if (new_offset < @sizeOf(WALHeader)) return error.InvalidTruncateOffset;
-        if (new_offset > self.header.tail_offset) return;
+        if (new_offset < headerSize()) return error.InvalidTruncateOffset;
+        if (new_offset > self.header.tail_offset) return error.InvalidTruncateOffset;
+
+        var offset = headerSize();
+        while (offset < new_offset) {
+            const parsed = try self.readRecordAtLocked(offset);
+            offset = parsed.next_offset;
+        }
+        if (offset != new_offset) return error.InvalidTruncateOffset;
 
         self.header.head_offset = new_offset;
-        self.header.updateChecksum();
-
+        if (self.header.last_checkpoint < new_offset) {
+            self.header.last_checkpoint = new_offset;
+        }
         try self.flushHeader();
     }
 
     pub fn flush(self: *Self) !void {
-        try self.flushHeader();
+        self.lock.lock();
+        defer self.lock.unlock();
+        try self.flushHeaderLocked();
+        try posix.msync(self.mapping, posix.MSF.SYNC);
     }
 
     fn flushHeader(self: *Self) !void {
-        _ = self;
+        self.header.updateChecksum();
+        try posix.msync(self.mapping[0..try toUsize(headerSize())], posix.MSF.SYNC);
+    }
+
+    fn flushHeaderLocked(self: *Self) !void {
+        self.header.updateChecksum();
+        try posix.msync(self.mapping[0..try toUsize(headerSize())], posix.MSF.SYNC);
     }
 
     pub fn sync(self: *Self) !void {
+        try posix.msync(self.mapping, posix.MSF.SYNC);
         try posix.fsync(self.file.handle);
     }
 
     pub fn getSize(self: *Self) u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
         return self.header.tail_offset;
     }
 
     pub fn getTransactionCount(self: *Self) u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
         return self.header.transaction_counter;
     }
 
     pub fn getLastCheckpoint(self: *Self) u64 {
+        self.lock.lock();
+        defer self.lock.unlock();
         return self.header.last_checkpoint;
     }
 
-    fn getNextSequence(self: *Self) u64 {
+    fn getNextSequenceLocked(self: *Self) u64 {
         self.sequence_counter += 1;
         return self.sequence_counter;
     }
 
-    fn expandFile(self: *Self) !void {
-        const new_size = self.mapped_size * 2;
+    fn recoverSequenceCounter(self: *Self) !u64 {
+        var max_sequence: u64 = 0;
+        var offset = self.header.head_offset;
 
-        posix.munmap(self.base_addr[0..self.mapped_size]);
+        while (offset < self.header.tail_offset) {
+            const parsed = try self.readRecordAtLocked(offset);
+            if (parsed.record.sequence > max_sequence) {
+                max_sequence = parsed.record.sequence;
+            }
+            offset = parsed.next_offset;
+        }
 
+        return max_sequence;
+    }
+
+    fn ensureMappedCapacity(self: *Self, required_size: u64) !void {
+        if (required_size <= self.mapped_size) return;
+
+        var new_size = self.mapped_size;
+        while (new_size < required_size) {
+            if (new_size > std.math.maxInt(u64) / 2) return error.WALFileTooLarge;
+            new_size *= 2;
+        }
+
+        try posix.msync(self.mapping, posix.MSF.SYNC);
         try self.file.setEndPos(new_size);
 
-        const new_base = try posix.mmap(
+        const new_len = try toUsize(new_size);
+        const new_mapping = try posix.mmap(
             null,
-            new_size,
+            new_len,
             posix.PROT.READ | posix.PROT.WRITE,
             .{ .TYPE = .SHARED },
             self.file.handle,
             0,
         );
+        errdefer posix.munmap(new_mapping);
 
-        self.base_addr = @ptrCast(@alignCast(new_base.ptr));
+        posix.munmap(self.mapping);
+
+        self.mapping = new_mapping;
         self.mapped_size = new_size;
-        self.header = @ptrCast(@alignCast(self.base_addr));
+        self.header = @ptrCast(@alignCast(self.mapping.ptr));
         self.header.file_size = new_size;
         self.header.updateChecksum();
+        try self.flushHeaderLocked();
+    }
+
+    fn writeAt(self: *Self, offset: u64, data: []const u8) !void {
+        const start = try toUsize(offset);
+        const end_u64 = try checkedAdd(offset, @as(u64, @intCast(data.len)));
+        const end = try toUsize(end_u64);
+        if (end_u64 > self.mapped_size) return error.WritePastMapping;
+        @memcpy(self.mapping[start..end], data);
+    }
+
+    const ParsedRecord = struct {
+        record: WALRecord,
+        next_offset: u64,
+    };
+
+    fn readRecordAtLocked(self: *Self, offset: u64) !ParsedRecord {
+        if (offset < headerSize()) return error.InvalidRecordOffset;
+        const record_end = try checkedAdd(offset, recordSize());
+        if (record_end > self.header.tail_offset) return error.TruncatedRecord;
+
+        const start = try toUsize(offset);
+        const end = try toUsize(record_end);
+        var record: WALRecord = undefined;
+        @memcpy(std.mem.asBytes(&record), self.mapping[start..end]);
+
+        try record.validate();
+        try validateRecordSemantics(&record, false);
+
+        var next_offset = record_end;
+        if (record.hasUndoData()) {
+            if (record.old_value_offset != record_end) return error.InvalidUndoOffset;
+            const undo_end = try checkedAdd(record.old_value_offset, record.old_value_size);
+            if (undo_end > self.header.tail_offset) return error.InvalidUndoOffset;
+            const undo_data = self.mapping[try toUsize(record.old_value_offset)..try toUsize(undo_end)];
+            if (computeDataChecksum(undo_data) != record.data_checksum) return error.DataChecksumMismatch;
+            next_offset = undo_end;
+        }
+
+        return ParsedRecord{
+            .record = record,
+            .next_offset = next_offset,
+        };
     }
 
     pub fn getUndoData(self: *Self, record: *const WALRecord) ![]const u8 {
-        if (record.old_value_size == 0) return &[_]u8{};
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.getUndoDataLocked(record);
+    }
+
+    fn getUndoDataLocked(self: *Self, record: *const WALRecord) ![]const u8 {
+        if (!record.hasUndoData()) return &[_]u8{};
+        if (record.old_value_size == 0) return error.InvalidUndoSize;
+        if (record.old_value_offset < headerSize()) return error.InvalidUndoOffset;
 
         const data_start = record.old_value_offset;
-        const data_end = data_start + record.old_value_size;
+        const data_end = try checkedAdd(data_start, record.old_value_size);
 
+        if (data_end > self.header.tail_offset) return error.InvalidUndoOffset;
         if (data_end > self.mapped_size) return error.InvalidUndoOffset;
 
-        return self.base_addr[data_start..data_end];
+        const data = self.mapping[try toUsize(data_start)..try toUsize(data_end)];
+        if (computeDataChecksum(data) != record.data_checksum) return error.DataChecksumMismatch;
+        return data;
     }
 };
 
+fn validateRecordSemantics(record: *const WALRecord, must_be_begin: bool) !void {
+    const record_type = try record.getType();
+
+    if (must_be_begin and record_type != .begin) return error.TransactionMustStartWithBegin;
+
+    switch (record_type) {
+        .begin, .commit, .rollback => {
+            if (record.offset != 0) return error.InvalidRecordOffset;
+            if (record.size != 0) return error.InvalidRecordSize;
+            if (record.hasUndoData()) return error.InvalidUndoDataForRecordType;
+        },
+        .checkpoint => {
+            if (record.transaction_id != 0) return error.InvalidTransactionId;
+            if (record.size != 0) return error.InvalidRecordSize;
+            if (record.hasUndoData()) return error.InvalidUndoDataForRecordType;
+        },
+        .write, .free, .root_update, .ref_count_dec, .free_list_remove, .heap_extend => {
+            _ = try checkedAdd(record.offset, record.size);
+        },
+        .allocate, .free_list_add, .ref_count_inc, .gc_mark, .gc_sweep => {
+            _ = try checkedAdd(record.offset, record.size);
+        },
+    }
+
+    if (!record.hasUndoData()) {
+        if (record.old_value_offset != 0) return error.InvalidUndoOffset;
+        if (record.old_value_size != 0) return error.InvalidUndoSize;
+        if (record.data_checksum != 0) return error.DataChecksumMismatch;
+    } else {
+        if (record.old_value_size == 0) return error.InvalidUndoSize;
+        if (record.old_value_offset < headerSize()) return error.InvalidUndoOffset;
+    }
+}
+
+fn recordValidateWithoutChecksumForPending(record: *const WALRecord) !void {
+    _ = try record.getType();
+    if ((record.flags & ~@as(u8, RECORD_FLAG_HAS_UNDO)) != 0) return error.InvalidRecordFlags;
+    if (!std.mem.eql(u8, record.padding[0..], &[_]u8{ 0, 0, 0, 0, 0, 0 })) return error.InvalidRecordPadding;
+}
+
 fn computeDataChecksum(data: []const u8) u32 {
-    const POLY: u32 = 0x82F63B78;
     var crc: u32 = 0xFFFFFFFF;
     for (data) |byte| {
-        crc ^= @as(u32, byte);
-        var j: usize = 0;
-        while (j < 8) : (j += 1) {
-            crc = if ((crc & 1) != 0) (crc >> 1) ^ POLY else crc >> 1;
-        }
+        crc = crc32cByte(crc, byte);
     }
     return crc ^ 0xFFFFFFFF;
 }
 
+fn crc32cByte(crc: u32, byte: u8) u32 {
+    const POLY: u32 = 0x82F63B78;
+    var c = crc ^ @as(u32, byte);
+    var j: usize = 0;
+    while (j < 8) : (j += 1) {
+        c = if ((c & 1) != 0) (c >> 1) ^ POLY else c >> 1;
+    }
+    return c;
+}
+
+fn checkedAdd(a: u64, b: u64) !u64 {
+    const result = @addWithOverflow(a, b);
+    if (result[1] != 0) return error.IntegerOverflow;
+    return result[0];
+}
+
+fn toUsize(value: u64) !usize {
+    if (value > std.math.maxInt(usize)) return error.ValueTooLarge;
+    return @as(usize, @intCast(value));
+}
+
+fn headerSize() u64 {
+    return @as(u64, @intCast(@sizeOf(WALHeader)));
+}
+
+fn recordSize() u64 {
+    return @as(u64, @intCast(@sizeOf(WALRecord)));
+}
+
+fn recordAlignment() u64 {
+    return @as(u64, @intCast(@alignOf(WALRecord)));
+}
+
 test "wal initialization" {
     const testing = std.testing;
+    _ = header;
+    _ = pointer;
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -595,10 +889,17 @@ test "wal initialization" {
     defer wal.deinit();
 
     try testing.expect(wal.header.magic == WAL_MAGIC);
+    try testing.expect(wal.header.version == WAL_VERSION);
+    try testing.expect(wal.header.tail_offset == headerSize());
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 }
 
 test "transaction lifecycle" {
     const testing = std.testing;
+    _ = header;
+    _ = pointer;
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -617,4 +918,45 @@ test "transaction lifecycle" {
 
     try wal.commitTransaction(&tx);
     try testing.expect(tx.state == .committed);
+
+    const records = try wal.getRecords(headerSize(), 16);
+    defer records.deinit();
+
+    try testing.expect(records.items.len == 3);
+
+    std.fs.cwd().deleteFile(test_path) catch {};
+}
+
+test "transaction with undo data" {
+    const testing = std.testing;
+    _ = header;
+    _ = pointer;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    const test_path = "/tmp/test_wal_undo.wal";
+    std.fs.cwd().deleteFile(test_path) catch {};
+
+    var wal = try WAL.init(alloc, test_path, null);
+    defer wal.deinit();
+
+    var tx = try wal.beginTransaction();
+    defer wal.endTransaction(&tx) catch {};
+
+    const old_data = "previous-value";
+    try wal.appendRecordWithData(&tx, .write, 128, old_data.len, old_data);
+    try wal.commitTransaction(&tx);
+
+    const records = try wal.getRecords(headerSize(), 16);
+    defer records.deinit();
+
+    try testing.expect(records.items.len == 3);
+    try testing.expect(records.items[1].hasUndoData());
+
+    const undo = try wal.getUndoData(&records.items[1]);
+    try testing.expect(std.mem.eql(u8, undo, old_data));
+
+    std.fs.cwd().deleteFile(test_path) catch {};
 }
