@@ -48,9 +48,8 @@ pub const PersistentHeap = struct {
 
         const requested_size = try normalizeHeapSize(size);
         const open_result = try openOrCreateFile(file_path, requested_size);
-        const file = open_result.file;
+        var file = open_result.file;
         errdefer file.close();
-
         var needs_init = open_result.needs_init;
         const mapped_size = open_result.map_size;
 
@@ -65,7 +64,9 @@ pub const PersistentHeap = struct {
         var heap_size: u64 = mapped_size;
 
         if (!needs_init) {
-            if (heap_header.validate()) |_| {
+            const header_valid: bool = if (heap_header.validate()) |_| true else |_| false;
+
+            if (header_valid) {
                 heap_size = heap_header.heap_size;
                 if (heap_size < minimumHeapSize()) {
                     return error.InvalidHeapSize;
@@ -76,7 +77,7 @@ pub const PersistentHeap = struct {
                 if (heap_size % pageSize() != 0) {
                     return error.InvalidHeapSize;
                 }
-            } else |_| {
+            } else {
                 needs_init = true;
             }
         }
@@ -87,7 +88,7 @@ pub const PersistentHeap = struct {
             heap_header.* = header.HeapHeader.init(mapped_size);
             heap_header.setDirty(false);
             heap_header.updateChecksum();
-            try flushRangeRaw(base_addr, heapHeaderSize());
+            try flushRangeRaw(base_addr, mapped_size);
             heap_size = mapped_size;
         }
 
@@ -177,10 +178,6 @@ pub const PersistentHeap = struct {
         }
 
         const addr = try ptrAt(self.base_addr, ptr.offset);
-        if (addr.len == 0) {
-            return error.OutOfBounds;
-        }
-
         const byte_ptr: *u8 = &addr[0];
         return @ptrCast(byte_ptr);
     }
@@ -450,9 +447,6 @@ pub const PersistentHeap = struct {
         }
 
         const old_size = self.size;
-        const old_base = self.base_addr;
-        const old_dirty_pages = self.dirty_pages;
-
         try self.flush();
         try self.file.setEndPos(aligned_new_size);
         errdefer self.file.setEndPos(old_size) catch {};
@@ -465,10 +459,19 @@ pub const PersistentHeap = struct {
         const new_base = try mapFile(self.file.handle, aligned_new_size);
         errdefer unmapFile(new_base);
 
+        const old_size_usize = try u64ToUsize(old_size);
+        const new_size_usize = try u64ToUsize(aligned_new_size);
+        if (new_size_usize > old_size_usize) {
+            @memset(new_base[old_size_usize..new_size_usize], 0);
+        }
+
         const new_header: *header.HeapHeader = @ptrCast(@alignCast(new_base.ptr));
         new_header.heap_size = aligned_new_size;
         new_header.updateChecksum();
-        try flushRangeRaw(new_base, heapHeaderSize());
+        try flushRangeRaw(new_base, aligned_new_size);
+
+        const old_base = self.base_addr;
+        const old_dirty_pages = self.dirty_pages;
 
         self.base_addr = new_base;
         self.mapped_size = aligned_new_size;
@@ -506,9 +509,7 @@ pub const PersistentHeap = struct {
 
     pub fn beginTransaction(self: *PersistentHeap) !void {
         const ov = @addWithOverflow(self.header.transaction_id, 1);
-        if (ov[1] != 0) {
-            return error.TransactionIdOverflow;
-        }
+        if (ov[1] != 0) return error.TransactionIdOverflow;
         self.header.transaction_id = ov[0];
         self.header.setDirty(true);
         self.header.updateChecksum();
@@ -531,17 +532,13 @@ pub const PersistentHeap = struct {
 
 fn checkedAddU64(a: u64, b: u64) !u64 {
     const ov = @addWithOverflow(a, b);
-    if (ov[1] != 0) {
-        return error.IntegerOverflow;
-    }
+    if (ov[1] != 0) return error.IntegerOverflow;
     return ov[0];
 }
 
 fn checkedMulU64(a: u64, b: u64) !u64 {
     const ov = @mulWithOverflow(a, b);
-    if (ov[1] != 0) {
-        return error.IntegerOverflow;
-    }
+    if (ov[1] != 0) return error.IntegerOverflow;
     return ov[0];
 }
 
@@ -701,27 +698,19 @@ fn flushRangeRaw(base_addr: []u8, len: u64) !void {
         return;
     }
 
-    if (base_addr.len == 0) {
-        return error.OutOfBounds;
-    }
-
     const ps = std.heap.pageSize();
     const addr_int = @intFromPtr(base_addr.ptr);
     const page_aligned = addr_int & ~(ps - 1);
     const offset_into_page = addr_int - page_aligned;
     const len_usize = try u64ToUsize(len);
 
-    if (len_usize > base_addr.len) {
-        return error.OutOfBounds;
-    }
-
+    const max_len = base_addr.len + offset_into_page;
     const ov = @addWithOverflow(len_usize, offset_into_page);
-    if (ov[1] != 0) {
-        return error.IntegerOverflow;
-    }
+    if (ov[1] != 0) return error.IntegerOverflow;
     const total_len = ov[0];
 
-    const aligned_len = try alignForwardUsize(total_len, ps);
+    const aligned_len_unbounded = try alignForwardUsize(total_len, ps);
+    const aligned_len = @min(aligned_len_unbounded, alignForwardUsize(max_len, ps) catch max_len);
 
     const aligned_ptr: [*]align(page_size_min) u8 = @ptrFromInt(page_aligned);
     try posix.msync(aligned_ptr[0..aligned_len], posix.MSF.SYNC);
@@ -734,9 +723,7 @@ fn alignForwardUsize(value: usize, alignment: usize) !usize {
 
     const mask = alignment - 1;
     const ov = @addWithOverflow(value, mask);
-    if (ov[1] != 0) {
-        return error.IntegerOverflow;
-    }
+    if (ov[1] != 0) return error.IntegerOverflow;
     return ov[0] & ~mask;
 }
 
@@ -765,7 +752,7 @@ test "heap allocation" {
     const heap = try PersistentHeap.init(alloc, test_path, 1024 * 1024, null);
     const ptr = try heap.allocate({}, 256, 64);
     try testing.expect(!ptr.isNull());
-    try testing.expect(ptr.offset >= minimumHeapSize());
+    try testing.expect(ptr.offset >= declaredHeaderSize());
     try heap.deinit();
 }
 
@@ -780,7 +767,7 @@ test "heap read/write" {
     const heap = try PersistentHeap.init(alloc, test_path, 1024 * 1024, null);
 
     const test_data: []const u8 = "Hello, Persistent World!";
-    const test_offset = minimumHeapSize();
+    const test_offset = declaredHeaderSize();
     try heap.write(test_offset, test_data);
 
     var buffer: [32]u8 = undefined;
